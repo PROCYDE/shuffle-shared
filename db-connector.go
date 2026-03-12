@@ -8449,7 +8449,7 @@ func GetWorkflowQueue(ctx context.Context, id string, limit int, inputEnv ...Env
 			stats.MonthlyChildAppExecutions = 0
 		}
 
-		limit := licenseOrg.SyncFeatures.AppExecutions.Limit
+		limit := int64(math.Max(float64(licenseOrg.SyncFeatures.AppExecutions.Limit), 500_000_000))
 		totalAppExecutions := stats.MonthlyAppExecutions + stats.MonthlyChildAppExecutions
 
 		license := checkNoInternet()
