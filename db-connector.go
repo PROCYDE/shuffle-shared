@@ -8133,7 +8133,7 @@ func GetWorkflowQueue(ctx context.Context, id string, limit int, inputEnv ...Env
 			stats.MonthlyChildAppExecutions = 0
 		}
 
-		limit := licenseOrg.SyncFeatures.AppExecutions.Limit
+		limit := int64(math.Max(float64(licenseOrg.SyncFeatures.AppExecutions.Limit), 500_000_000))
 		totalAppExecutions := stats.MonthlyAppExecutions + stats.MonthlyChildAppExecutions
 
 		license := checkNoInternet()
@@ -10855,7 +10855,7 @@ func GetOrgNotifications(ctx context.Context, orgId string) ([]Notification, err
 			"size": 1000,
 			"sort": map[string]interface{}{
 				"updated_at": map[string]interface{}{
-					"order": "desc",
+					"order":         "desc",
 					"unmapped_type": "long",
 				},
 			},
@@ -16299,37 +16299,37 @@ func GetAllCacheKeys(ctx context.Context, orgId string, category string, max int
 		if parentOrgDepth >= 3 {
 			log.Printf("[ERROR] Reached maximum parent org lookup depth (%d) for org %s. Skipping parent org cache lookup to prevent infinite recursion.", parentOrgDepth, orgId)
 		} else {
-		parentOrg, err := GetOrg(ctx, foundOrg.CreatorOrg)
-		if err != nil {
+			parentOrg, err := GetOrg(ctx, foundOrg.CreatorOrg)
+			if err != nil {
 				if debug {
 					log.Printf("[DEBUG] Could not find parent org %s for org %s (possibly in different region): %s", foundOrg.CreatorOrg, orgId, err)
 				}
-		} else {
+			} else {
 				parentOrgCache, _, err := GetAllCacheKeys(ctx, parentOrg.Id, "", max, inputcursor, cleanupDepth, parentOrgDepth+1)
-			if err != nil {
+				if err != nil {
 					if debug {
 						log.Printf("[DEBUG] Failed getting parent org cache keys for org %s: %s", parentOrg.Id, err)
 					}
-			} else {
-				if debug {
-					//log.Printf("[DEBUG] Loaded %d parent org cache keys for org %s. Validating if child org %s should get the keys", len(parentOrgCache), parentOrg.Id, orgId)
-				}
-
-				for _, parentCache := range parentOrgCache {
-					/*
-						if debug && len(parentCache.SuborgDistribution) > 0 {
-							log.Printf("[DEBUG] Parent org %s keys: %#v", parentOrg.Id, parentCache.SuborgDistribution)
-						}
-					*/
-
-					if !ArrayContains(parentCache.SuborgDistribution, orgId) {
-						continue
+				} else {
+					if debug {
+						//log.Printf("[DEBUG] Loaded %d parent org cache keys for org %s. Validating if child org %s should get the keys", len(parentOrgCache), parentOrg.Id, orgId)
 					}
 
-					// Clean up just in case
-					parentCache.PublicAuthorization = ""
-					parentCache.SuborgDistribution = []string{orgId}
-					cacheKeys = append(cacheKeys, parentCache)
+					for _, parentCache := range parentOrgCache {
+						/*
+							if debug && len(parentCache.SuborgDistribution) > 0 {
+								log.Printf("[DEBUG] Parent org %s keys: %#v", parentOrg.Id, parentCache.SuborgDistribution)
+							}
+						*/
+
+						if !ArrayContains(parentCache.SuborgDistribution, orgId) {
+							continue
+						}
+
+						// Clean up just in case
+						parentCache.PublicAuthorization = ""
+						parentCache.SuborgDistribution = []string{orgId}
+						cacheKeys = append(cacheKeys, parentCache)
 					}
 				}
 			}
