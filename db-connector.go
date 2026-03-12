@@ -8504,7 +8504,7 @@ func GetWorkflowQueue(ctx context.Context, id string, limit int, inputEnv ...Env
 			stats.MonthlyChildWorkflowExecutions = 0
 		}
 
-		limit := licenseOrg.SyncFeatures.WorkflowExecutions.Limit
+		limit := int64(math.Max(float64(licenseOrg.SyncFeatures.WorkflowExecutions.Limit), 10_000_000))
 		totalWorkflowExecutions := stats.MonthlyWorkflowExecutions + stats.MonthlyChildWorkflowExecutions
 
 		if totalWorkflowExecutions > limit {
