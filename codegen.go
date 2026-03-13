@@ -61,8 +61,6 @@ type countingWriter struct {
 	n *int64
 }
 
-
-
 func CopyFile(fromfile, tofile string) error {
 	from, err := os.Open(fromfile)
 	if err != nil {
@@ -4801,7 +4799,7 @@ func handleRunDatastoreAutomation(cacheData CacheKeyData, automation DatastoreAu
 
 	// These are ran pre-execution
 	if parsedName == "security_rules" {
-		return nil 
+		return nil
 	}
 
 	// Unmarshal cacheData.Value to parsedOutput
@@ -4824,7 +4822,7 @@ func handleRunDatastoreAutomation(cacheData CacheKeyData, automation DatastoreAu
 		"timestamp":           cacheData.Edited,
 		"workflow_id":         cacheData.WorkflowId,
 		"suborg_distribution": cacheData.SuborgDistribution,
-		"tags": 			   cacheData.Tags,
+		"tags":                cacheData.Tags,
 	}
 
 	marshalledBody, err := json.Marshal(parsedOutput)
@@ -4876,7 +4874,7 @@ func handleRunDatastoreAutomation(cacheData CacheKeyData, automation DatastoreAu
 		}
 
 		// Already handled check
-		for _, option := range automation.Options { 
+		for _, option := range automation.Options {
 			// 'remove' icon in the UI does this
 			if option.Disabled {
 				continue
@@ -4903,8 +4901,7 @@ func handleRunDatastoreAutomation(cacheData CacheKeyData, automation DatastoreAu
 
 			SetCache(ctx, cacheName, []byte("1"), 3)
 
-
-			if !strings.Contains(option.Key, "action") { 
+			if !strings.Contains(option.Key, "action") {
 				log.Printf("[WARNING] Agent option key %s does not contain 'action' - skipping to avoid confusion. This may cause the agent to not run if no other options are present.", option.Key)
 				continue
 			}
@@ -4925,9 +4922,8 @@ func handleRunDatastoreAutomation(cacheData CacheKeyData, automation DatastoreAu
 			option.Value += fmt.Sprintf("\n%s", cacheData.Value)
 			parsedParams = append(parsedParams, map[string]string{
 				"name":  "input",
-				"value": fmt.Sprintf("TASK: %s\nKey: %s\nCategory: %s\n\nUNTRUSTED DATA:\n%s", option.Value, cacheData.Key, cacheData.Category,  cacheData.Value),
+				"value": fmt.Sprintf("TASK: %s\nKey: %s\nCategory: %s\n\nUNTRUSTED DATA:\n%s", option.Value, cacheData.Key, cacheData.Category, cacheData.Value),
 			})
-
 
 			agentUrl := fmt.Sprintf("%s/api/v1/apps/agent_starter/run", backendUrl)
 			agentStartRequest := AgentStartRequest{
@@ -4969,7 +4965,7 @@ func handleRunDatastoreAutomation(cacheData CacheKeyData, automation DatastoreAu
 
 			// Makes sure we don't re-run the same twice
 			cacheData.Tags = append(cacheData.Tags, agentTagName)
-			err = SetDatastoreKeyMeta(ctx, cacheData) 
+			err = SetDatastoreKeyMeta(ctx, cacheData)
 			if err != nil {
 				log.Printf("[ERROR] Failed to set cache key after running AI agent: %s", err)
 			}
@@ -4981,8 +4977,7 @@ func handleRunDatastoreAutomation(cacheData CacheKeyData, automation DatastoreAu
 				return err
 			}
 
-
-			if debug { 
+			if debug {
 				log.Printf("[DEBUG] RESP FOR RUNNING AI AGENT (%d): %s", resp.StatusCode, string(body))
 			}
 
@@ -5121,7 +5116,7 @@ func handleRunDatastoreAutomation(cacheData CacheKeyData, automation DatastoreAu
 
 				handled = append(handled, workflowId)
 				formattedBodyStruct := ExecutionRequest{
-					ExecutionSource: fmt.Sprintf("datastore_%s_%s", cacheData.Category, cacheData.Key),
+					ExecutionSource:   fmt.Sprintf("datastore_%s_%s", cacheData.Category, cacheData.Key),
 					ExecutionArgument: string(marshalledBody),
 				}
 
