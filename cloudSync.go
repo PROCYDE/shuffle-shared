@@ -2176,7 +2176,7 @@ func RunAgentDecisionSingulActionHandler(execution WorkflowExecution, decision A
 		for _, field := range parsedFields {
 			if strings.ToLower(field.Key) == "url" && field.Value != "" {
 				urlValue = strings.TrimSpace(field.Value)
-				continue 
+				continue
 			}
 			newFields = append(newFields, field)
 		}
@@ -2227,9 +2227,9 @@ func RunAgentDecisionSingulActionHandler(execution WorkflowExecution, decision A
 	}
 
 	parsedAction := CategoryAction{
-		AppName:  decision.Tool,
-		Label:    decision.Action,
-		Query:    decision.Reason,   // Add the reason field for LLM context
+		AppName: decision.Tool,
+		Label:   decision.Action,
+		Query:   decision.Reason, // Add the reason field for LLM context
 
 		Fields: oldFields,
 	}
