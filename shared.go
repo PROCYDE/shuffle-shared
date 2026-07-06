@@ -603,7 +603,7 @@ func HandleSet2fa(resp http.ResponseWriter, request *http.Request) {
 
 		if len(user.Session) != 0 {
 			log.Printf("[INFO] User session exists - resetting session")
-			expiration := time.Now().Add(8 * time.Hour)
+			expiration := getSessionExpiration()
 
 			newCookie := ConstructSessionCookie(user.Session, expiration)
 
@@ -631,7 +631,7 @@ func HandleSet2fa(resp http.ResponseWriter, request *http.Request) {
 				loginData = string(newData)
 			}
 
-			err = SetSession(ctx, user, user.Session)
+			err = SetSession(ctx, &user, user.Session)
 			if err != nil {
 				log.Printf("[WARNING] Error adding session to database: %s", err)
 			} else {
@@ -655,7 +655,7 @@ func HandleSet2fa(resp http.ResponseWriter, request *http.Request) {
 
 			log.Printf("[INFO] User session for %s (%s) is empty - create one!", user.Username, user.Id)
 			sessionToken := uuid.NewV4().String()
-			expiration := time.Now().Add(8 * time.Hour)
+			expiration := getSessionExpiration()
 			newCookie := ConstructSessionCookie(sessionToken, expiration)
 
 			// Does it not set both?
@@ -665,7 +665,7 @@ func HandleSet2fa(resp http.ResponseWriter, request *http.Request) {
 			http.SetCookie(resp, newCookie)
 
 			// ADD TO DATABASE
-			err = SetSession(ctx, user, sessionToken)
+			err = SetSession(ctx, &user, sessionToken)
 			if err != nil {
 				log.Printf("[DEBUG] Error adding session to database: %s", err)
 			}
@@ -3875,7 +3875,7 @@ func HandleApiAuthentication(resp http.ResponseWriter, request *http.Request) (U
 		} else {
 			// Check if both session tokens are set
 			// Compatibility issues
-			//expiration := time.Now().Add(8 * time.Hour)
+			//expiration := getSessionExpiration()
 			newCookie := ConstructSessionCookie(sessionToken, c.Expires)
 			newCookie.MaxAge = c.MaxAge
 
@@ -13069,7 +13069,7 @@ func HandleChangeUserOrg(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	expiration := time.Now().Add(8 * time.Hour)
+	expiration := getSessionExpiration()
 
 	newCookie := ConstructSessionCookie(user.Session, expiration)
 	http.SetCookie(resp, newCookie)
@@ -16800,7 +16800,7 @@ func HandleLogin(resp http.ResponseWriter, request *http.Request) {
 	// Had to set this due to session hashing rollback
 	if len(userdata.Session) != 0 && len(userdata.Session) == 36 && !changeActiveOrg {
 		log.Printf("[INFO] User session exists - resetting session")
-		expiration := time.Now().Add(8 * time.Hour)
+		expiration := getSessionExpiration()
 
 		newCookie := ConstructSessionCookie(userdata.Session, expiration)
 		http.SetCookie(resp, newCookie)
@@ -16842,7 +16842,7 @@ func HandleLogin(resp http.ResponseWriter, request *http.Request) {
 			loginData = string(newData)
 		}
 
-		err = SetSession(ctx, userdata, userdata.Session)
+		err = SetSession(ctx, &userdata, userdata.Session)
 		if err != nil {
 			log.Printf("[WARNING] Error adding session to database: %s", err)
 		} else {
@@ -16864,7 +16864,7 @@ func HandleLogin(resp http.ResponseWriter, request *http.Request) {
 		log.Printf("[INFO] User session for %s (%s) is empty - create one!", userdata.Username, userdata.Id)
 
 		sessionToken := uuid.NewV4().String()
-		expiration := time.Now().Add(8 * time.Hour)
+		expiration := getSessionExpiration()
 		newCookie := ConstructSessionCookie(sessionToken, expiration)
 
 		// Does it not set both?
@@ -16874,7 +16874,7 @@ func HandleLogin(resp http.ResponseWriter, request *http.Request) {
 		http.SetCookie(resp, newCookie)
 
 		// ADD TO DATABASE
-		err = SetSession(ctx, userdata, sessionToken)
+		err = SetSession(ctx, &userdata, sessionToken)
 		if err != nil {
 			log.Printf("[DEBUG] Error adding session to database: %s", err)
 		}
@@ -23789,7 +23789,7 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 				}
 
 				// Session management
-				expiration := time.Now().Add(8 * time.Hour)
+				expiration := getSessionExpiration()
 				if len(user.Session) == 0 {
 					log.Printf("[INFO] User does NOT have session - creating - (1)")
 					sessionToken := uuid.NewV4().String()
@@ -23798,7 +23798,7 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 					newCookie.Name = "__session"
 					http.SetCookie(resp, newCookie)
 
-					err = SetSession(ctx, user, sessionToken)
+					err = SetSession(ctx, &user, sessionToken)
 					if err != nil {
 						log.Printf("[WARNING] Error creating session for user: %s", err)
 						resp.WriteHeader(401)
@@ -23814,7 +23814,7 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 					newCookie.Name = "__session"
 					http.SetCookie(resp, newCookie)
 
-					err = SetSession(ctx, user, sessionToken)
+					err = SetSession(ctx, &user, sessionToken)
 					if err != nil {
 						log.Printf("[WARNING] Error creating session for user: %s", err)
 						resp.WriteHeader(401)
@@ -24044,7 +24044,7 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 				user.SetSSOInfo(org.Id, orgSSOInfo)
 
 				// Session management
-				expiration := time.Now().Add(8 * time.Hour)
+				expiration := getSessionExpiration()
 				if len(user.Session) == 0 {
 					log.Printf("[INFO] User does NOT have session - creating - (2)")
 					sessionToken := uuid.NewV4().String()
@@ -24053,7 +24053,7 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 					newCookie.Name = "__session"
 					http.SetCookie(resp, newCookie)
 
-					err = SetSession(ctx, user, sessionToken)
+					err = SetSession(ctx, &user, sessionToken)
 					if err != nil {
 						log.Printf("[WARNING] Error creating session for user: %s", err)
 						resp.WriteHeader(401)
@@ -24069,7 +24069,7 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 					newCookie.Name = "__session"
 					http.SetCookie(resp, newCookie)
 
-					err = SetSession(ctx, user, sessionToken)
+					err = SetSession(ctx, &user, sessionToken)
 					if err != nil {
 						log.Printf("[WARNING] Error creating session for user: %s", err)
 						resp.WriteHeader(401)
@@ -24483,7 +24483,7 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 					Role: role,
 				}
 
-				expiration := time.Now().Add(8 * time.Hour)
+				expiration := getSessionExpiration()
 				if len(user.Session) == 0 {
 					log.Printf("[INFO] User does NOT have session - creating - (1)")
 					sessionToken := uuid.NewV4().String()
@@ -24494,7 +24494,7 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 					newCookie.Name = "__session"
 					http.SetCookie(resp, newCookie)
 
-					err = SetSession(ctx, user, sessionToken)
+					err = SetSession(ctx, &user, sessionToken)
 					if err != nil {
 						log.Printf("[WARNING] Error creating session for user: %s", err)
 						resp.WriteHeader(401)
@@ -24512,7 +24512,7 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 					newCookie.Name = "__session"
 					http.SetCookie(resp, newCookie)
 
-					err = SetSession(ctx, user, sessionToken)
+					err = SetSession(ctx, &user, sessionToken)
 					if err != nil {
 						log.Printf("[WARNING] Error creating session for user: %s", err)
 						resp.WriteHeader(401)
@@ -24658,7 +24658,7 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 					Role: role,
 				}
 
-				expiration := time.Now().Add(8 * time.Hour)
+				expiration := getSessionExpiration()
 				if len(user.Session) == 0 {
 					log.Printf("[INFO] User does NOT have session - creating - (2)")
 					sessionToken := uuid.NewV4().String()
@@ -24668,7 +24668,7 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 					newCookie.Name = "__session"
 					http.SetCookie(resp, newCookie)
 
-					err = SetSession(ctx, user, sessionToken)
+					err = SetSession(ctx, &user, sessionToken)
 					if err != nil {
 						log.Printf("[WARNING] Error creating session for user: %s", err)
 						resp.WriteHeader(401)
@@ -24686,7 +24686,7 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 					newCookie.Name = "__session"
 					http.SetCookie(resp, newCookie)
 
-					err = SetSession(ctx, user, sessionToken)
+					err = SetSession(ctx, &user, sessionToken)
 					if err != nil {
 						log.Printf("[WARNING] Error creating session for user: %s", err)
 						resp.WriteHeader(401)
@@ -24840,7 +24840,7 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 	newUser.Id = ID.String()
 	newUser.VerificationToken = verifyToken.String()
 
-	expiration := time.Now().Add(8 * time.Hour)
+	expiration := getSessionExpiration()
 	//if len(user.Session) == 0 {
 	log.Printf("[INFO] User does NOT have session - creating")
 	sessionToken := uuid.NewV4().String()
@@ -24851,7 +24851,7 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 	newCookie.Name = "__session"
 	http.SetCookie(resp, newCookie)
 
-	err = SetSession(ctx, *newUser, sessionToken)
+	err = SetSession(ctx, newUser, sessionToken)
 	if err != nil {
 		log.Printf("[WARNING] Error creating session for user: %s", err)
 		resp.WriteHeader(401)
