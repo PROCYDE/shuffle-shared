@@ -831,8 +831,8 @@ func RunOpenidLogin(ctx context.Context, clientId, baseUrl, redirectUri, code, c
 
 	token, err := conf.Exchange(ctx, code, options...)
 	if err != nil {
+		log.Printf("[WARNING] OpenID token exchange failed: %s", err)
 		sanitizedErr := sanitizeOpenIDTokenExchangeError(err)
-		log.Printf("[WARNING] OpenID token exchange failed: %s", sanitizedErr)
 		return []byte{}, sanitizedErr
 	}
 

@@ -15833,8 +15833,20 @@ func openIDScopesForOrg(org Org) []string {
 	return scopes
 }
 
-// GetOpenIdUrl generates an OpenID Connect authorization URL.
-// Both cloud and on-prem use authorization code flow with PKCE.
+// GetOpenIdUrl generates an OpenID Connect authorization URL using
+// authorization code flow with PKCE (both cloud and on-prem).
+//
+// The user parameter controls the ExpectedUser field stored in the OIDC
+// login transaction. When the callback fires, it verifies that the
+// authenticated SSO identity matches ExpectedUser — preventing session
+// fixation attacks where one user initiates SSO but another completes it.
+//
+// Pass a populated user when the caller already knows who should complete
+// the flow (authenticated org-switch, forced SSO after password login,
+// admin provisioning). Pass User{} (empty) for unauthenticated contexts
+// like the login page SSO button, where any valid SSO user should be
+// allowed to complete the flow — ExpectedUser will be "" and the callback
+// skips the mismatch check.
 func GetOpenIdUrl(request *http.Request, org Org, user User, mode string) (string, error) {
 	return getOpenIdUrlCodeFlow(request, org, user, mode)
 }
