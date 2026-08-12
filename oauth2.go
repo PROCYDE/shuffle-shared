@@ -14,7 +14,7 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"regexp"
+	"net/url"
 	"strconv"
 
 	//"net/url"
@@ -813,48 +813,63 @@ func (v *CodeVerifier) CodeChallengeS256() string {
 }
 
 // https://dev-18062.okta.com/oauth2/default/v1/authorize?client_id=0oa3&response_type=code&scope=openid&redirect_uri=http%3A%2F%2Flocalhost%3A5002%2Fapi%2Fv1%2Flogin_openid&state=state-296bc9a0-a2a2-4a57-be1a-d0e2fd9bb601&code_challenge_method=S256&code_challenge=codechallenge
-func RunOpenidLogin(ctx context.Context, clientId, baseUrl, redirectUri, code, codeChallenge, clientSecret string) ([]byte, error) {
-	client := &http.Client{}
-	data := fmt.Sprintf("client_id=%s&grant_type=authorization_code&redirect_uri=%s&code=%s", clientId, redirectUri, code)
-
-	if len(codeChallenge) > 0 {
-		data += fmt.Sprintf("&code_verifier=%s", codeChallenge)
+func RunOpenidLogin(ctx context.Context, clientId, baseUrl, redirectUri, code, codeVerifier, clientSecret string) ([]byte, error) {
+	conf := &oauth2.Config{
+		ClientID:     clientId,
+		ClientSecret: clientSecret,
+		RedirectURL:  redirectUri,
+		Endpoint: oauth2.Endpoint{
+			TokenURL:  baseUrl,
+			AuthStyle: oauth2.AuthStyleInParams,
+		},
 	}
 
-	if len(clientSecret) > 0 {
-		data += fmt.Sprintf("&client_secret=%s", clientSecret)
+	options := []oauth2.AuthCodeOption{}
+	if len(codeVerifier) > 0 {
+		options = append(options, oauth2.VerifierOption(codeVerifier))
 	}
 
-	req, err := http.NewRequest(
-		"POST",
-		baseUrl,
-		bytes.NewBuffer([]byte(data)),
-	)
-
-	req.Header.Add("content-type", "application/x-www-form-urlencoded")
-	req.Header.Add("accept", "application/json")
-	req.Header.Add("cache-control", "no-cache")
-	res, err := client.Do(req)
+	token, err := conf.Exchange(ctx, code, options...)
 	if err != nil {
-		log.Printf("[WARNING] OpenID Client: %s", err)
-		return []byte{}, err
+		sanitizedErr := sanitizeOpenIDTokenExchangeError(err)
+		log.Printf("[WARNING] OpenID token exchange failed: %s", sanitizedErr)
+		return []byte{}, sanitizedErr
 	}
 
-	defer res.Body.Close()
-	body, err := ioutil.ReadAll(res.Body)
+	idToken, _ := token.Extra("id_token").(string)
+	scope, _ := token.Extra("scope").(string)
+	expiresIn := 0
+	if !token.Expiry.IsZero() {
+		expiresIn = int(time.Until(token.Expiry).Seconds())
+		if expiresIn < 0 {
+			expiresIn = 0
+		}
+	}
+
+	openIDResponse := OpenidResp{
+		AccessToken: token.AccessToken,
+		IdToken:     idToken,
+		Scope:       scope,
+		TokenType:   token.TokenType,
+		ExpiresIn:   expiresIn,
+	}
+
+	body, err := json.Marshal(openIDResponse)
 	if err != nil {
-		log.Printf("[WARNING] OpenID client Body: %s", err)
-		return []byte{}, err
+		return []byte{}, fmt.Errorf("failed to marshal OpenID token response: %w", err)
 	}
 
-	log.Printf("OpenID return BODY: %s (status: %d)", body, res.StatusCode)
-
-	if res.StatusCode >= 400 {
-		log.Printf("[WARNING] OpenID returned %d with body: %s", res.StatusCode, body)
-		return []byte{}, fmt.Errorf("OpenID token request failed with status %d: %s", res.StatusCode, body)
-	}
-
+	log.Printf("[INFO] OpenID token exchange succeeded")
 	return body, nil
+}
+
+func sanitizeOpenIDTokenExchangeError(err error) error {
+	var retrieveErr *oauth2.RetrieveError
+	if errors.As(err, &retrieveErr) && retrieveErr.Response != nil {
+		return fmt.Errorf("OpenID token request failed with status %d", retrieveErr.Response.StatusCode)
+	}
+
+	return fmt.Errorf("OpenID token request failed")
 }
 
 func GetGithubClient(ctx context.Context, code string, accessToken OauthToken, redirectUri string) (*http.Client, *oauth2.Token, error) {
@@ -1753,41 +1768,72 @@ func fetchWellKnownConfig(ctx context.Context, issuer string, openIdAuthUrl stri
 	return config, nil
 }
 
-// IdTokenClaims represents the claims extracted from a verified ID token
-func DecodeIdTokenClaims(idToken string) (*IdTokenClaims, error) {
-	parts := strings.Split(idToken, ".")
-	if len(parts) != 3 {
-		return nil, fmt.Errorf("invalid id_token: expected 3 parts, got %d", len(parts))
-	}
-
-	payload := parts[1]
-	if m := len(payload) % 4; m != 0 {
-		payload += strings.Repeat("=", 4-m)
-	}
-
-	decoded, err := base64.StdEncoding.DecodeString(payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to base64 decode id_token payload: %w", err)
-	}
-
-	var claims IdTokenClaims
-	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal id_token claims: %w", err)
-	}
-
-	return &claims, nil
-}
-
 type IdTokenClaims struct {
 	Issuer        string   `json:"iss"`
 	Sub           string   `json:"sub"`
 	Email         string   `json:"email"`
 	EmailVerified bool     `json:"email_verified"`
+	Nonce         string   `json:"nonce"`
 	Roles         []string `json:"roles"`
 	Groups        []string `json:"groups"`
 	RealmAccess   struct {
 		Roles []string `json:"roles"`
 	} `json:"realm_access"` // Keycloak format
+}
+
+func OpenIDIssuerFromConfig(config SSOConfig) (string, error) {
+	for _, endpoint := range []string{config.OpenIdAuthorization, config.OpenIdToken} {
+		issuer, ok := openIDIssuerFromEndpoint(endpoint)
+		if ok {
+			return issuer, nil
+		}
+	}
+
+	return "", errors.New("failed to derive OpenID issuer from configured authorization or token URL")
+}
+
+// openIDIssuerFromEndpoint derives discovery issuer URLs only from admin-configured
+// endpoints. Do not use the unverified ID token "iss" claim to choose a provider.
+func openIDIssuerFromEndpoint(endpoint string) (string, bool) {
+	if endpoint == "" || endpoint == "none" {
+		return "", false
+	}
+
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", false
+	}
+
+	issuerPath := strings.TrimRight(parsed.Path, "/")
+	if issuerPath == "" {
+		return "", false
+	}
+
+	switch {
+	case strings.Contains(issuerPath, "/protocol/openid-connect/"):
+		// Keycloak exposes auth/token below /protocol/openid-connect, while the
+		// issuer is the realm URL above that path.
+		issuerPath = issuerPath[:strings.Index(issuerPath, "/protocol/openid-connect/")]
+	case strings.Contains(issuerPath, "/oauth2/v2.0/"):
+		// Microsoft Entra ID v2 discovery uses /{tenant}/v2.0 even though the
+		// authorization and token endpoints include /oauth2/v2.0.
+		issuerPath = issuerPath[:strings.Index(issuerPath, "/oauth2/v2.0/")] + "/v2.0"
+	case strings.Contains(issuerPath, "/v1/") && strings.Contains(issuerPath[:strings.Index(issuerPath, "/v1/")], "/oauth2"):
+		issuerPath = issuerPath[:strings.Index(issuerPath, "/v1/")]
+	case strings.HasSuffix(issuerPath, "/authorize") || strings.HasSuffix(issuerPath, "/token"):
+		issuerPath = issuerPath[:strings.LastIndex(issuerPath, "/")]
+	default:
+		return "", false
+	}
+
+	if issuerPath == "" {
+		issuerPath = "/"
+	}
+	parsed.Path = issuerPath
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+
+	return strings.TrimRight(parsed.String(), "/"), true
 }
 
 // VerifyIdTokenWithOIDC verifies an ID token using the go-oidc library and extracts claims
@@ -1832,133 +1878,17 @@ func VerifyIdTokenWithOIDC(ctx context.Context, idToken string, issuer string, c
 	return &claims, nil
 }
 
-// ExtractRolesFromIdToken verifies an ID token and extracts roles from various claim formats
-// Returns a deduplicated list of roles from: roles, groups, realm_access.roles (Keycloak)
-func ExtractRolesFromIdToken(ctx context.Context, idToken string, issuer string, clientID string) ([]string, error) {
-	claims, err := VerifyIdTokenWithOIDC(ctx, idToken, issuer, clientID)
+func VerifyIdTokenForOrg(ctx context.Context, idToken string, org Org) (*IdTokenClaims, error) {
+	issuer, err := OpenIDIssuerFromConfig(org.SSOConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	// Collect roles from all possible sources
-	roleSet := make(map[string]bool)
-
-	for _, role := range claims.Roles {
-		roleSet[role] = true
-	}
-	for _, group := range claims.Groups {
-		roleSet[group] = true
-	}
-	for _, role := range claims.RealmAccess.Roles {
-		roleSet[role] = true
-	}
-
-	// Convert to slice
-	roles := make([]string, 0, len(roleSet))
-	for role := range roleSet {
-		roles = append(roles, role)
-	}
-
-	return roles, nil
+	return VerifyIdTokenWithOIDC(ctx, idToken, issuer, org.SSOConfig.OpenIdClientId)
 }
 
 func VerifyIdToken(ctx context.Context, idToken string) (IdTokenCheck, error) {
-	// Check org in nonce -> check if ID points back to an org
-	outerSplit := strings.Split(string(idToken), ".")
-	for _, innerstate := range outerSplit {
-		log.Printf("[DEBUG] OpenID STATE (temporary): %s", innerstate)
-		decoded, err := base64.StdEncoding.DecodeString(innerstate)
-		if err != nil {
-			log.Printf("[DEBUG] Failed base64 decode of state (1): %s", err)
-
-			// Random padding problems
-			innerstate += "="
-			decoded, err = base64.StdEncoding.DecodeString(innerstate)
-			if err != nil {
-				log.Printf("[DEBUG] Failed base64 decode of state (2): %s", err)
-
-				// Double padding problem fix lol (this actually works)
-				innerstate += "="
-				decoded, err = base64.StdEncoding.DecodeString(innerstate)
-				if err != nil {
-					log.Printf("[ERROR] Failed base64 decode of state (3): %s", err)
-					continue
-				}
-			}
-		}
-
-		var token IdTokenCheck
-		err = json.Unmarshal([]byte(decoded), &token)
-		if err != nil {
-			log.Printf("[INFO] IDToken unmarshal error: %s", err)
-			continue
-		}
-
-		// Aud = client secret
-		// Nonce = contains all the info
-		if len(token.Aud) <= 0 {
-			log.Printf("[WARNING] Couldn't find AUD in JSON (required) - continuing to check. Current: %s", string(decoded))
-			continue
-		}
-
-		if len(token.Nonce) > 0 {
-			parsedState, err := base64.StdEncoding.DecodeString(token.Nonce)
-			if err != nil {
-				log.Printf("[ERROR] Failed state split: %s", err)
-			}
-
-			foundOrg := ""
-			foundChallenge := ""
-			stateSplit := strings.Split(string(parsedState), "&")
-			regexPattern := `EXTRA string=([A-Za-z0-9~.]+)`
-			re := regexp.MustCompile(regexPattern)
-			for _, innerstate := range stateSplit {
-				itemsplit := strings.SplitN(innerstate, "=", 2)
-				if len(itemsplit) <= 1 {
-					log.Printf("[WARNING] No key:value: %s", innerstate)
-					continue
-				}
-
-				key := strings.TrimSpace(itemsplit[0])
-				value := strings.TrimSpace(itemsplit[1])
-				if itemsplit[0] == "org" {
-					foundOrg = value
-				}
-
-				if key == "challenge" {
-					// Extract the "extra string" value from the challenge value
-					matches := re.FindStringSubmatch(value)
-					if len(matches) > 1 {
-						extractedString := matches[1]
-						foundChallenge = extractedString
-						log.Printf("Extracted 'extra string' value is: %s", extractedString)
-					} else {
-						foundChallenge = strings.TrimSpace(itemsplit[1])
-						log.Printf("No 'extra string' value found in challenge: %s", value)
-					}
-				}
-			}
-
-			if len(foundOrg) == 0 {
-				log.Printf("[ERROR] No org specified in state (2)")
-				return IdTokenCheck{}, err
-			}
-			org, err := GetOrg(ctx, foundOrg)
-			if err != nil {
-				log.Printf("[WARNING] Error getting org in OpenID (2): %s", err)
-				return IdTokenCheck{}, err
-			}
-			// Validating the user itself
-			if token.Aud == org.SSOConfig.OpenIdClientId || foundChallenge == org.SSOConfig.OpenIdClientSecret {
-				log.Printf("[DEBUG] Correct token aud & challenge - successful login!")
-				token.Org = *org
-				return token, nil
-			} else {
-			}
-		}
-	}
-
-	return IdTokenCheck{}, errors.New("Couldn't verify nonce")
+	return IdTokenCheck{}, errors.New("legacy unsigned id_token verification is disabled")
 }
 
 func IsRunningInCluster() bool {

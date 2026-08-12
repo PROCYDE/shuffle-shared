@@ -15675,129 +15675,251 @@ func verifier() (*CodeVerifier, error) {
 	return CreateCodeVerifierFromBytes(b)
 }
 
-// GetOpenIdUrl generates an OpenID Connect authorization URL.
-// On cloud: supports mode-based flows (login vs setup), stores PKCE verifier on user.
-// On-prem: original logic with form_post support when client_secret exists.
-// The user and mode params are only used on cloud — on-prem callers can pass User{} and "".
-func GetOpenIdUrl(request *http.Request, org Org, user User, mode string) (string, error) {
-	if project.Environment == "cloud" {
-		return getOpenIdUrlCloud(request, org, user, mode)
+type oidcLoginTransaction struct {
+	OrgID         string
+	RedirectURI   string
+	CodeVerifier  string
+	CodeChallenge string
+	Nonce         string
+	Mode          string
+	ExpectedUser  string
+	ClientID      string
+	ExpiresAt     time.Time
+}
+
+const (
+	openIDLoginTransactionCachePrefix       = "oidc_login_transaction_"
+	openIDLoginTransactionExpirationMinutes = int32(10)
+)
+
+var (
+	openIDLocalStateWarningOnce sync.Once
+	// Cloud setup mode still persists the PKCE verifier on the user record
+	// before redirecting because the existing callback path validates it there.
+	// Tests replace this function to exercise URL generation without a datastore.
+	setOpenIDSetupUser = SetUser
+)
+
+func newOpenIDRandomValue() (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
 	}
-	return getOpenIdUrlOnPrem(request, org)
+
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func openIDLoginTransactionCacheKey(state string) string {
+	return fmt.Sprintf("%s%s", openIDLoginTransactionCachePrefix, state)
+}
+
+func warnIfOpenIDTransactionsAreLocal() {
+	if len(memcached) > 0 {
+		return
+	}
+
+	openIDLocalStateWarningOnce.Do(func() {
+		log.Printf("[WARNING] OpenID login state is stored in this backend process because SHUFFLE_MEMCACHED is empty. Configure SHUFFLE_MEMCACHED or use sticky backend sessions before running multiple backend replicas.")
+	})
+}
+
+// Store login state through the cache abstraction. With SHUFFLE_MEMCACHED this
+// is shared across backend replicas; otherwise it intentionally falls back to
+// the existing local cache and warns because callbacks must reach the same pod.
+func storeOpenIDLoginTransaction(state string, transaction oidcLoginTransaction) error {
+	if state == "" {
+		return errors.New("OpenID state is empty")
+	}
+	if transaction.ExpiresAt.IsZero() {
+		transaction.ExpiresAt = time.Now().Add(time.Duration(openIDLoginTransactionExpirationMinutes) * time.Minute)
+	}
+
+	data, err := json.Marshal(transaction)
+	if err != nil {
+		return fmt.Errorf("failed to marshal OpenID state: %w", err)
+	}
+
+	warnIfOpenIDTransactionsAreLocal()
+	if err := SetCache(context.Background(), openIDLoginTransactionCacheKey(state), data, openIDLoginTransactionExpirationMinutes); err != nil {
+		return fmt.Errorf("failed to store OpenID state: %w", err)
+	}
+
+	return nil
+}
+
+// Cache backends return []byte for memcached/local cache, but tests and some
+// legacy paths may surface strings; keep the decode strict so bad state fails.
+func openIDCacheBytes(cacheValue interface{}) ([]byte, error) {
+	switch value := cacheValue.(type) {
+	case []byte:
+		return value, nil
+	case string:
+		return []byte(value), nil
+	default:
+		return nil, fmt.Errorf("unexpected OpenID state cache value type %T", cacheValue)
+	}
+}
+
+func consumeOpenIDLoginTransaction(state string) (oidcLoginTransaction, error) {
+	if state == "" {
+		return oidcLoginTransaction{}, errors.New("OpenID state is empty")
+	}
+
+	cacheKey := openIDLoginTransactionCacheKey(state)
+	cachedTransaction, err := GetCache(context.Background(), cacheKey)
+	if err != nil {
+		return oidcLoginTransaction{}, errors.New("invalid OpenID state")
+	}
+	defer DeleteCache(context.Background(), cacheKey)
+
+	data, err := openIDCacheBytes(cachedTransaction)
+	if err != nil {
+		return oidcLoginTransaction{}, err
+	}
+
+	transaction := oidcLoginTransaction{}
+	if err := json.Unmarshal(data, &transaction); err != nil {
+		return oidcLoginTransaction{}, fmt.Errorf("failed to parse OpenID state: %w", err)
+	}
+	if time.Now().After(transaction.ExpiresAt) {
+		return oidcLoginTransaction{}, errors.New("expired OpenID state")
+	}
+
+	return transaction, nil
+}
+
+func openIDCallbackURLFromBase(baseURL string) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if strings.Contains(baseURL, "/api/v1/login_openid") {
+		return baseURL
+	}
+
+	return fmt.Sprintf("%s/api/v1/login_openid", baseURL)
+}
+
+func getOpenIDRedirectURL(request *http.Request) string {
+	// Preserve the existing explicit override behavior: if SSO_REDIRECT_URL is
+	// set, it wins for both cloud and on-prem callbacks.
+	if len(os.Getenv("SSO_REDIRECT_URL")) > 0 {
+		return openIDCallbackURLFromBase(os.Getenv("SSO_REDIRECT_URL"))
+	}
+
+	// Default to shuffler.io for cloud.
+	if project.Environment == "cloud" {
+		return openIDCallbackURLFromBase("https://shuffler.io")
+	}
+
+	if len(os.Getenv("BASE_URL")) > 0 {
+		return openIDCallbackURLFromBase(os.Getenv("BASE_URL"))
+	}
+
+	return "http://localhost:5001/api/v1/login_openid"
+}
+
+func normalizedOpenIDMode(mode string) string {
+	if mode == "signin" || mode == "login" {
+		return "login"
+	}
+
+	return mode
+}
+
+func openIDScopesForOrg(org Org) []string {
+	scopes := []string{"openid", "email"}
+	if strings.Contains(org.SSOConfig.OpenIdAuthorization, "login.microsoftonline.com") {
+		scopes = append(scopes, "User.Read")
+	}
+
+	return scopes
+}
+
+// GetOpenIdUrl generates an OpenID Connect authorization URL.
+// Both cloud and on-prem use authorization code flow with PKCE.
+func GetOpenIdUrl(request *http.Request, org Org, user User, mode string) (string, error) {
+	return getOpenIdUrlCodeFlow(request, org, user, mode)
 }
 
 func getOpenIdUrlOnPrem(request *http.Request, org Org) (string, error) {
-	baseSSOUrl := org.SSOConfig.OpenIdAuthorization
-
-	codeChallenge := uuid.NewV4().String()
-	verifier, verifiererr := verifier()
-	if verifiererr == nil {
-		codeChallenge = verifier.Value
-	}
-
-	redirectUrl := url.QueryEscape(fmt.Sprintf("http://%s/api/v1/login_openid", request.Host))
-
-	if strings.Contains(request.Host, "shuffle-backend") && !strings.Contains(os.Getenv("BASE_URL"), "shuffle-backend") {
-		redirectUrl = url.QueryEscape(fmt.Sprintf("%s/api/v1/login_openid", os.Getenv("BASE_URL")))
-	} else {
-		if len(os.Getenv("BASE_URL")) > 0 {
-			redirectUrl = url.QueryEscape(fmt.Sprintf("%s/api/v1/login_openid", os.Getenv("BASE_URL")))
-		} else {
-			redirectUrl = url.QueryEscape(fmt.Sprintf("http://localhost:5001/api/v1/login_openid"))
-		}
-	}
-
-	if len(os.Getenv("SSO_REDIRECT_URL")) > 0 {
-		redirectUrl = url.QueryEscape(fmt.Sprintf("%s/api/v1/login_openid", os.Getenv("SSO_REDIRECT_URL")))
-	}
-
-	state := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("org=%s&challenge=%s&redirect=%s", org.Id, codeChallenge, redirectUrl)))
-
-	if verifiererr == nil {
-		codeChallenge = verifier.CodeChallengeS256()
-	}
-
-	if len(org.SSOConfig.OpenIdClientSecret) > 0 {
-		state := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("org=%s&redirect=%s&challenge=%s", org.Id, redirectUrl, org.SSOConfig.OpenIdClientSecret)))
-		baseSSOUrl += fmt.Sprintf("?client_id=%s&response_type=id_token&scope=openid email&redirect_uri=%s&state=%s&response_mode=form_post&nonce=%s", org.SSOConfig.OpenIdClientId, redirectUrl, state, state)
-	} else {
-		baseSSOUrl += fmt.Sprintf("?client_id=%s&response_type=code&scope=openid email&redirect_uri=%s&state=%s&code_challenge_method=S256&code_challenge=%s", org.SSOConfig.OpenIdClientId, redirectUrl, state, codeChallenge)
-	}
-
-	return baseSSOUrl, nil
+	return getOpenIdUrlCodeFlow(request, org, User{}, "")
 }
 
 func getOpenIdUrlCloud(request *http.Request, org Org, user User, mode string) (string, error) {
-	baseSSOUrl := org.SSOConfig.OpenIdAuthorization
+	return getOpenIdUrlCodeFlow(request, org, user, mode)
+}
 
-	signIn := mode == "signin" || mode == "login"
-
-	verifier, verifiererr := verifier()
-	if verifiererr != nil {
-		return "", verifiererr
+func getOpenIdUrlCodeFlow(request *http.Request, org Org, user User, mode string) (string, error) {
+	if len(org.SSOConfig.OpenIdAuthorization) == 0 {
+		return "", errors.New("OpenID authorization URL is empty")
+	}
+	if len(org.SSOConfig.OpenIdClientId) == 0 {
+		return "", errors.New("OpenID client ID is empty")
 	}
 
-	codeChallenge := verifier.CodeChallengeS256()
+	pkceVerifier, err := verifier()
+	if err != nil {
+		return "", err
+	}
 
-	if !signIn {
+	state, err := newOpenIDRandomValue()
+	if err != nil {
+		return "", err
+	}
+	nonce, err := newOpenIDRandomValue()
+	if err != nil {
+		return "", err
+	}
+
+	codeChallenge := pkceVerifier.CodeChallengeS256()
+	redirectURL := getOpenIDRedirectURL(request)
+	transactionMode := normalizedOpenIDMode(mode)
+
+	if project.Environment == "cloud" && transactionMode != "login" && len(user.Id) > 0 {
 		user.InitSSOInfos()
-
 		existingSSOInfo, _ := user.GetSSOInfo(org.Id)
 		user.SetSSOInfo(org.Id, SSOInfo{
 			Sub:             existingSSOInfo.Sub,
 			ClientID:        org.SSOConfig.OpenIdClientId,
-			CodeVerifier:    verifier.Value,
-			ChallengeExpiry: time.Now().Add(60 * time.Minute),
+			CodeVerifier:    pkceVerifier.Value,
+			ChallengeExpiry: time.Now().Add(10 * time.Minute),
 		})
 
-		ctx := context.Background()
-		err := SetUser(ctx, &user, true)
-		if err != nil {
+		if err := setOpenIDSetupUser(context.Background(), &user, true); err != nil {
 			return "", err
 		}
-	} else {
-		log.Printf("[DEBUG] Generating SSO login link for all non-logged in users using the org")
 	}
 
-	baseUrl := "https://shuffler.io"
-	if len(os.Getenv("SSO_REDIRECT_URL")) > 0 {
-		baseUrl = os.Getenv("SSO_REDIRECT_URL")
-	}
-	redirectUrl := fmt.Sprintf("%s/api/v1/login_openid", baseUrl)
-
-	state := ""
-	if !signIn {
-		state = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("org=%s&challenge=%s&redirect=%s", org.Id, codeChallenge, redirectUrl)))
-	} else {
-		state = base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("org=%s&mode=login&redirect=%s", org.Id, redirectUrl)))
-	}
-
-	isMicrosoft := strings.Contains(org.SSOConfig.OpenIdAuthorization, "login.microsoftonline.com")
-
-	scopes := []string{"openid", "email"}
-	if isMicrosoft {
-		scopes = append(scopes, "User.Read")
+	if err := storeOpenIDLoginTransaction(state, oidcLoginTransaction{
+		OrgID:         org.Id,
+		RedirectURI:   redirectURL,
+		CodeVerifier:  pkceVerifier.Value,
+		CodeChallenge: codeChallenge,
+		Nonce:         nonce,
+		Mode:          transactionMode,
+		ExpectedUser:  user.Id,
+		ClientID:      org.SSOConfig.OpenIdClientId,
+		ExpiresAt:     time.Now().Add(10 * time.Minute),
+	}); err != nil {
+		return "", err
 	}
 
-	usePKCE := !signIn
+	authorizationURL, err := url.Parse(org.SSOConfig.OpenIdAuthorization)
+	if err != nil {
+		return "", err
+	}
 
-	params := url.Values{}
+	params := authorizationURL.Query()
 	params.Set("client_id", org.SSOConfig.OpenIdClientId)
 	params.Set("response_type", "code")
-	params.Set("scope", strings.Join(scopes, " "))
+	params.Set("scope", strings.Join(openIDScopesForOrg(org), " "))
+	params.Set("redirect_uri", redirectURL)
 	params.Set("state", state)
-	params.Set("redirect_uri", redirectUrl)
+	params.Set("nonce", nonce)
+	params.Set("code_challenge_method", "S256")
+	params.Set("code_challenge", codeChallenge)
+	authorizationURL.RawQuery = params.Encode()
 
-	if usePKCE {
-		params.Set("code_challenge_method", "S256")
-		params.Set("code_challenge", codeChallenge)
-	}
-
-	baseSSOUrl = baseSSOUrl + "?" + params.Encode()
-
-	log.Printf("[DEBUG] Generated SSO URL: %s", baseSSOUrl)
-
-	return baseSSOUrl, nil
+	log.Printf("[DEBUG] Generated OpenID authorization URL for org %s", org.Id)
+	return authorizationURL.String(), nil
 }
 
 func HandleGenerateProvisionUrl(resp http.ResponseWriter, request *http.Request) {
@@ -23361,202 +23483,176 @@ func fixCertificate(parsedX509Key string) string {
 	return parsedX509Key
 }
 
+func getOpenIDCallbackCodeAndState(request *http.Request) (string, string, error) {
+	if request.Method == http.MethodPost {
+		if err := request.ParseForm(); err != nil {
+			return "", "", fmt.Errorf("failed parsing OpenID callback form: %w", err)
+		}
+		if len(request.Form.Get("id_token")) > 0 && len(request.Form.Get("code")) == 0 {
+			return "", "", errors.New("direct OpenID id_token callbacks are not supported")
+		}
+	}
+
+	code := request.URL.Query().Get("code")
+	if len(code) == 0 {
+		code = request.Form.Get("code")
+	}
+	if len(code) == 0 {
+		return "", "", errors.New("No code specified")
+	}
+
+	state := request.URL.Query().Get("state")
+	if len(state) == 0 {
+		state = request.Form.Get("state")
+	}
+	if len(state) == 0 {
+		return "", "", errors.New("No state specified")
+	}
+
+	return code, state, nil
+}
+
+// rolesFromVerifiedIDToken extracts roles from various claim formats.
+// Returns a deduplicated list of roles from: roles, groups, realm_access.roles (Keycloak)
+func rolesFromVerifiedIDToken(claims *IdTokenClaims) []string {
+	// Collect roles from all possible sources
+	roleSet := make(map[string]bool)
+
+	for _, role := range claims.Roles {
+		roleSet[role] = true
+	}
+	for _, group := range claims.Groups {
+		roleSet[group] = true
+	}
+	for _, role := range claims.RealmAccess.Roles {
+		roleSet[role] = true
+	}
+
+	// Convert to slice
+	roles := make([]string, 0, len(roleSet))
+	for role := range roleSet {
+		roles = append(roles, role)
+	}
+
+	return roles
+}
+
+func shuffleRoleFromOpenIDRoles(openIDRoles []string) (string, bool) {
+	hasUserRole := false
+	hasOrgReaderRole := false
+
+	for _, openIDRole := range openIDRoles {
+		switch strings.TrimSpace(openIDRole) {
+		case "shuffle-admin":
+			return "admin", true
+		case "shuffle-user":
+			hasUserRole = true
+		case "shuffle-org-reader":
+			hasOrgReaderRole = true
+		}
+	}
+
+	if hasUserRole {
+		return "user", true
+	}
+	if hasOrgReaderRole {
+		return "org-reader", true
+	}
+
+	return "user", false
+}
+
+func openIDRoleRequiredSatisfied(openIDRoles []string) bool {
+	_, foundRole := shuffleRoleFromOpenIDRoles(openIDRoles)
+	return foundRole
+}
+
+func syncOpenIDRoleToOrg(org *Org, userID, role string) bool {
+	for i, orgUser := range org.Users {
+		if orgUser.Id == userID {
+			if org.Users[i].Role != role {
+				org.Users[i].Role = role
+				return true
+			}
+
+			return false
+		}
+	}
+
+	return false
+}
+
+func handleOpenIDCodeCallback(ctx context.Context, request *http.Request) (OpenidUserinfo, *Org, oidcLoginTransaction, error) {
+	code, state, err := getOpenIDCallbackCodeAndState(request)
+	if err != nil {
+		return OpenidUserinfo{}, &Org{}, oidcLoginTransaction{}, err
+	}
+
+	transaction, err := consumeOpenIDLoginTransaction(state)
+	if err != nil {
+		return OpenidUserinfo{}, &Org{}, oidcLoginTransaction{}, err
+	}
+
+	org, err := GetOrg(ctx, transaction.OrgID)
+	if err != nil {
+		return OpenidUserinfo{}, &Org{}, oidcLoginTransaction{}, fmt.Errorf("couldn't find the org for sign-in in Shuffle: %w", err)
+	}
+
+	if transaction.ClientID != "" && transaction.ClientID != org.SSOConfig.OpenIdClientId {
+		return OpenidUserinfo{}, &Org{}, oidcLoginTransaction{}, errors.New("OpenID client ID changed during login")
+	}
+	if len(org.SSOConfig.OpenIdToken) == 0 {
+		return OpenidUserinfo{}, &Org{}, oidcLoginTransaction{}, fmt.Errorf("No token URL specified in org %s", org.Id)
+	}
+	if len(transaction.CodeVerifier) == 0 {
+		return OpenidUserinfo{}, &Org{}, oidcLoginTransaction{}, errors.New("OpenID PKCE verifier is missing")
+	}
+
+	body, err := RunOpenidLogin(ctx, org.SSOConfig.OpenIdClientId, org.SSOConfig.OpenIdToken, transaction.RedirectURI, code, transaction.CodeVerifier, org.SSOConfig.OpenIdClientSecret)
+	if err != nil {
+		return OpenidUserinfo{}, &Org{}, oidcLoginTransaction{}, err
+	}
+
+	openid := OpenidResp{}
+	if err := json.Unmarshal(body, &openid); err != nil {
+		return OpenidUserinfo{}, &Org{}, oidcLoginTransaction{}, fmt.Errorf("failed parsing OpenID token response: %w", err)
+	}
+
+	if openid.IdToken == "" {
+		return OpenidUserinfo{}, &Org{}, oidcLoginTransaction{}, errors.New("No id_token in token response. Ensure 'openid' scope is requested.")
+	}
+
+	idTokenClaims, err := VerifyIdTokenForOrg(ctx, openid.IdToken, *org)
+	if err != nil {
+		return OpenidUserinfo{}, &Org{}, oidcLoginTransaction{}, fmt.Errorf("failed to verify id_token: %w", err)
+	}
+	if idTokenClaims.Nonce == "" || idTokenClaims.Nonce != transaction.Nonce {
+		return OpenidUserinfo{}, &Org{}, oidcLoginTransaction{}, errors.New("OpenID nonce mismatch")
+	}
+
+	return OpenidUserinfo{
+		Sub:   idTokenClaims.Sub,
+		Email: idTokenClaims.Email,
+		Roles: rolesFromVerifiedIDToken(idTokenClaims),
+	}, org, transaction, nil
+}
+
 // handleOpenIdCloud handles the OpenID Connect callback for cloud environments.
 // Supports mode-based flows (login vs setup/registration), PKCE verification,
 // proper OIDC token verification, and SSO identity validation.
 func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 	ctx := GetContext(request)
 
-	codeChallenge := ""
-	foundMode := ""
-
-	openidUser := OpenidUserinfo{}
-	org := &Org{}
-	code := request.URL.Query().Get("code")
-	if len(code) == 0 {
-		log.Printf("SSO callback failed. URL=%s, error=%s, error_description=%s, state=%s", request.URL.String(), request.URL.Query().Get("error"), request.URL.Query().Get("error_description"), request.URL.Query().Get("state"))
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Must enable PKCE to use shuffle SSO"}`)))
-		resp.WriteHeader(401)
-		return
-	}
-
-	state := request.URL.Query().Get("state")
-	if len(state) == 0 {
-		resp.WriteHeader(401)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "No state specified"}`)))
-		return
-	}
-
-	stateBase, err := base64.StdEncoding.DecodeString(state)
+	openidUser, org, transaction, err := handleOpenIDCodeCallback(ctx, request)
 	if err != nil {
-		log.Printf("[ERROR] Failed base64 decode OpenID state: %s", err)
+		log.Printf("[ERROR] OpenID callback failed: %s", err)
 		resp.WriteHeader(401)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Failed base64 decoding of state"}`)))
+		resp.Write([]byte(`{"success": false, "reason": "OpenID authentication failed"}`))
 		return
 	}
 
-	log.Printf("State: %s", stateBase)
-	foundOrg := ""
-	foundRedir := ""
-	foundChallenge := ""
-	stateSplit := strings.Split(string(stateBase), "&")
-	for _, innerstate := range stateSplit {
-		itemsplit := strings.Split(innerstate, "=")
-		if len(itemsplit) <= 1 {
-			log.Printf("[WARNING] No key:value: %s", innerstate)
-			continue
-		}
-
-		if itemsplit[0] == "org" {
-			foundOrg = strings.TrimSpace(itemsplit[1])
-		}
-
-		if itemsplit[0] == "redirect" {
-			foundRedir = strings.TrimSpace(itemsplit[1])
-		}
-
-		if itemsplit[0] == "challenge" {
-			foundChallenge = strings.TrimSpace(itemsplit[1])
-		}
-
-		if itemsplit[0] == "mode" {
-			foundMode = strings.TrimSpace(itemsplit[1])
-		}
-	}
-
-	log.Printf("challenge: %s", foundChallenge)
-	log.Printf("code sent: %s", code)
-	log.Printf("mode: %s", foundMode)
-
-	if len(foundOrg) == 0 {
-		log.Printf("[ERROR] No org specified in state")
-		resp.WriteHeader(401)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "No org specified in state"}`)))
-		return
-	}
-
-	org, err = GetOrg(ctx, foundOrg)
-	if err != nil {
-		log.Printf("[WARNING] Error getting org in OpenID: %s", err)
-		resp.WriteHeader(401)
-		resp.Write([]byte(`{"success": false, "reason": "Couldn't find the org for sign-in in Shuffle"}`))
-		return
-	}
-
-	clientId := org.SSOConfig.OpenIdClientId
-	tokenUrl := org.SSOConfig.OpenIdToken
-	if len(tokenUrl) == 0 {
-		log.Printf("[ERROR] No token URL specified for OpenID. OrgID: %s", foundOrg)
-		resp.WriteHeader(401)
-		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "No token URL specified in org %s. Please make sure to specify a token URL in the /admin panel in Shuffle for OpenID Connect"}`, foundOrg)))
-		return
-	}
-
-	// Handle login mode (no PKCE) vs registration mode (with PKCE)
-	var foundVerifier string
-	if foundMode == "login" {
-		log.Printf("[INFO] Login mode detected, skipping PKCE verification")
-		foundVerifier = "login_mode"
-	} else {
-		log.Printf("[DEBUG] Searching %d org users for PKCE verifier matching challenge %s", len(org.Users), foundChallenge)
-		for _, userInOrg := range org.Users {
-			fullUser, err := GetUser(ctx, userInOrg.Id)
-			if err != nil {
-				log.Printf("[WARNING] Failed to load user %s in org %s during PKCE search: %s", userInOrg.Id, org.Id, err)
-				continue
-			}
-			ssoInfo, exists := fullUser.GetSSOInfo(org.Id)
-			if !exists {
-				log.Printf("[DEBUG] User %s (%s) has no SSOInfo for org %s", fullUser.Username, fullUser.Id, org.Id)
-				continue
-			}
-			if ssoInfo.CodeVerifier == "" {
-				log.Printf("[DEBUG] User %s (%s) has SSOInfo but empty CodeVerifier", fullUser.Username, fullUser.Id)
-				continue
-			}
-			verifierObj := &CodeVerifier{Value: ssoInfo.CodeVerifier}
-			computed := verifierObj.CodeChallengeS256()
-			log.Printf("[DEBUG] User %s (%s): stored verifier hash=%s, expected=%s, match=%t", fullUser.Username, fullUser.Id, computed, foundChallenge, computed == foundChallenge)
-			if computed == foundChallenge {
-				foundVerifier = ssoInfo.CodeVerifier
-				break
-			}
-		}
-
-		if foundVerifier == "" {
-			log.Printf("[ERROR] No verifier found for challenge %s in org %s (searched %d users)", foundChallenge, org.Id, len(org.Users))
-			resp.WriteHeader(401)
-			resp.Write([]byte(`{"success": false, "reason": "Invalid PKCE challenge"}`))
-			return
-		}
-	}
-
-	verifierToUse := foundVerifier
-	if foundMode == "login" {
-		verifierToUse = ""
-	}
-
-	body, err := RunOpenidLogin(ctx, clientId, tokenUrl, foundRedir, code, verifierToUse, org.SSOConfig.OpenIdClientSecret)
-	if err != nil {
-		log.Printf("[WARNING] Error with body read of OpenID Connect: %s", err)
-		resp.WriteHeader(401)
-		resp.Write([]byte(`{"success": false}`))
-		return
-	}
-
-	codeChallenge = foundChallenge
-
-	openid := OpenidResp{}
-	err = json.Unmarshal(body, &openid)
-	if err != nil {
-		log.Printf("[WARNING] Error in Openid marshal: %s", err)
-		resp.WriteHeader(401)
-		resp.Write([]byte(`{"success": false}`))
-		return
-	}
-
-	if openid.IdToken == "" {
-		log.Printf("[ERROR] No id_token in OpenID token response for org %s", foundOrg)
-		resp.WriteHeader(401)
-		resp.Write([]byte(`{"success": false, "reason": "No id_token in token response. Ensure 'openid' scope is requested."}`))
-		return
-	}
-
-	// Decode first to extract the issuer, then verify with OIDC
-	unverified, err := DecodeIdTokenClaims(openid.IdToken)
-	if err != nil {
-		log.Printf("[ERROR] Failed to decode id_token: %s", err)
-		resp.WriteHeader(401)
-		resp.Write([]byte(`{"success": false, "reason": "Failed to decode id_token"}`))
-		return
-	}
-
-	idTokenClaims, err := VerifyIdTokenWithOIDC(ctx, openid.IdToken, unverified.Issuer, org.SSOConfig.OpenIdClientId)
-	if err != nil {
-		log.Printf("[ERROR] OIDC id_token verification failed: %s", err)
-		resp.WriteHeader(401)
-		resp.Write([]byte(`{"success": false, "reason": "Failed to verify id_token"}`))
-		return
-	}
-
-	openidUser.Sub = idTokenClaims.Sub
-	openidUser.Email = idTokenClaims.Email
-
-	if len(idTokenClaims.Roles) > 0 || len(idTokenClaims.Groups) > 0 || len(idTokenClaims.RealmAccess.Roles) > 0 {
-		roleSet := make(map[string]bool)
-		for _, r := range idTokenClaims.Roles {
-			roleSet[r] = true
-		}
-		for _, g := range idTokenClaims.Groups {
-			roleSet[g] = true
-		}
-		for _, r := range idTokenClaims.RealmAccess.Roles {
-			roleSet[r] = true
-		}
-		for role := range roleSet {
-			openidUser.Roles = append(openidUser.Roles, role)
-		}
-	}
+	codeChallenge := transaction.CodeChallenge
+	foundMode := transaction.Mode
 
 	if len(openidUser.Sub) == 0 && len(openidUser.Email) == 0 {
 		log.Printf("[WARNING] No user found in openid login (2)")
@@ -23602,6 +23698,13 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 	if err == nil && len(users) > 0 {
 		for _, user := range users {
 			if user.GeneratedUsername == userName {
+				if transaction.ExpectedUser != "" && user.Id != transaction.ExpectedUser {
+					log.Printf("[WARNING] OpenID callback for %s tried to complete setup for unexpected generated user %s instead of %s", userName, user.Id, transaction.ExpectedUser)
+					resp.WriteHeader(401)
+					resp.Write([]byte(`{"success": false, "reason": "OpenID user mismatch"}`))
+					return
+				}
+
 				foundOrgInUser := false
 				for _, userOrg := range user.Orgs {
 					if userOrg == org.Id {
@@ -23636,46 +23739,16 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 					log.Printf("[AUDIT] Found user %s (%s) which matches SSO info for %s. Redirecting to login! - (1)", user.Username, user.Id, userName)
 				}
 
-				if org.SSOConfig.RoleRequired {
-					foundRole := false
-					for _, role := range openidUser.Roles {
-						if role == "shuffle-admin" || role == "shuffle-user" || role == "shuffle-org-reader" {
-							foundRole = true
-						}
-					}
-
-					if !foundRole {
-						log.Printf("[WARNING] User %s (%s) role is missing in respone for org %s (%s). Please contact the administrator - (1)", user.Username, user.Id, org.Name, org.Id)
-						resp.WriteHeader(401)
-						resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
-						return
-					}
+				if org.SSOConfig.RoleRequired && !openIDRoleRequiredSatisfied(openidUser.Roles) {
+					log.Printf("[WARNING] User %s (%s) role is missing in respone for org %s (%s). Please contact the administrator - (1)", user.Username, user.Id, org.Name, org.Id)
+					resp.WriteHeader(401)
+					resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
+					return
 				}
 
-				role := user.Role
-				roleChange := false
-				if len(openidUser.Roles) > 0 {
-					for _, newRole := range openidUser.Roles {
-						if newRole == "shuffle-admin" {
-							role = "admin"
-							user.Role = "admin"
-							roleChange = true
-							break
-						}
-						if newRole == "shuffle-user" {
-							role = "user"
-							user.Role = "user"
-							roleChange = true
-							break
-						}
-						if newRole == "shuffle-org-reader" {
-							role = "org-reader"
-							user.Role = "org-reader"
-							roleChange = true
-							break
-						}
-					}
-				}
+				role, _ := shuffleRoleFromOpenIDRoles(openidUser.Roles)
+				roleChange := user.Role != role
+				user.Role = role
 
 				user.ActiveOrg = OrgMini{
 					Name: org.Name,
@@ -23837,16 +23910,8 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 					return
 				}
 
-				if roleChange {
-					for i, usr := range org.Users {
-						if usr.Id == user.Id {
-							org.Users[i].Role = role
-							break
-						}
-					}
-				}
-
-				if !foundUserInOrg || roleChange {
+				orgRoleChange := syncOpenIDRoleToOrg(org, user.Id, role)
+				if !foundUserInOrg || roleChange || orgRoleChange {
 					err = SetOrg(ctx, *org, org.Id)
 					if err != nil {
 						log.Printf("[WARNING] Failed updating org when setting user: %s", err)
@@ -23867,6 +23932,13 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 	if err == nil && len(users) > 0 {
 		for _, user := range users {
 			if user.Username == userName {
+				if transaction.ExpectedUser != "" && user.Id != transaction.ExpectedUser {
+					log.Printf("[WARNING] OpenID callback for %s tried to complete setup for unexpected user %s instead of %s", userName, user.Id, transaction.ExpectedUser)
+					resp.WriteHeader(401)
+					resp.Write([]byte(`{"success": false, "reason": "OpenID user mismatch"}`))
+					return
+				}
+
 				foundOrgInUser := false
 				for _, userOrg := range user.Orgs {
 					if userOrg == org.Id {
@@ -23900,46 +23972,16 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 					log.Printf("[AUDIT] Found user %s (%s) which matches SSO info for %s", user.Username, user.Id, userName)
 				}
 
-				if org.SSOConfig.RoleRequired {
-					foundRole := false
-					for _, role := range openidUser.Roles {
-						if role == "shuffle-admin" || role == "shuffle-user" || role == "shuffle-org-reader" {
-							foundRole = true
-						}
-					}
-
-					if !foundRole {
-						log.Printf("[WARNING] User %s (%s) role is missing in respone for org %s (%s). Please contact the administrator - (2)", user.Username, user.Id, org.Name, org.Id)
-						resp.WriteHeader(401)
-						resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
-						return
-					}
+				if org.SSOConfig.RoleRequired && !openIDRoleRequiredSatisfied(openidUser.Roles) {
+					log.Printf("[WARNING] User %s (%s) role is missing in respone for org %s (%s). Please contact the administrator - (2)", user.Username, user.Id, org.Name, org.Id)
+					resp.WriteHeader(401)
+					resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
+					return
 				}
 
-				role := user.Role
-				roleChange := false
-				if len(openidUser.Roles) > 0 {
-					for _, newRole := range openidUser.Roles {
-						if newRole == "shuffle-admin" {
-							role = "admin"
-							user.Role = "admin"
-							roleChange = true
-							break
-						}
-						if newRole == "shuffle-user" {
-							role = "user"
-							user.Role = "user"
-							roleChange = true
-							break
-						}
-						if newRole == "shuffle-org-reader" {
-							role = "org-reader"
-							user.Role = "org-reader"
-							roleChange = true
-							break
-						}
-					}
-				}
+				role, _ := shuffleRoleFromOpenIDRoles(openidUser.Roles)
+				roleChange := user.Role != role
+				user.Role = role
 
 				user.ActiveOrg = OrgMini{
 					Name: org.Name,
@@ -24092,16 +24134,8 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 					return
 				}
 
-				if roleChange {
-					for i, usr := range org.Users {
-						if usr.Id == user.Id {
-							org.Users[i].Role = role
-							break
-						}
-					}
-				}
-
-				if !foundUserInOrg || roleChange {
+				orgRoleChange := syncOpenIDRoleToOrg(org, user.Id, role)
+				if !foundUserInOrg || roleChange || orgRoleChange {
 					err = SetOrg(ctx, *org, org.Id)
 					if err != nil {
 						log.Printf("[WARNING] Failed updating org when setting session: %s", err)
@@ -24132,20 +24166,11 @@ func handleOpenIdCloud(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	if org.SSOConfig.RoleRequired {
-		foundRole := false
-		for _, role := range openidUser.Roles {
-			if role == "shuffle-admin" || role == "shuffle-user" || role == "shuffle-org-reader" {
-				foundRole = true
-			}
-		}
-
-		if !foundRole {
-			log.Printf("[WARNING] Role is missing in respone for username %s. Please contact the administrator - (3)", userName)
-			resp.WriteHeader(401)
-			resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
-			return
-		}
+	if org.SSOConfig.RoleRequired && !openIDRoleRequiredSatisfied(openidUser.Roles) {
+		log.Printf("[WARNING] Role is missing in respone for username %s. Please contact the administrator - (3)", userName)
+		resp.WriteHeader(401)
+		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
+		return
 	}
 
 	log.Printf("[AUDIT] Disabled new user creation")
@@ -24170,167 +24195,12 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 	// On-prem path below
 	ctx := GetContext(request)
 
-	skipValidation := false
-	openidUser := OpenidUserinfo{}
-	org := &Org{}
-	code := request.URL.Query().Get("code")
-	if len(code) == 0 {
-		// Check id_token grant info
-		if request.Method == "POST" {
-			body, err := ioutil.ReadAll(request.Body)
-			if err != nil {
-				resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "No code or id_token specified - body read error in POST"}`)))
-				resp.WriteHeader(401)
-				return
-			}
-
-			stateSplit := strings.Split(string(body), "&")
-			for _, innerstate := range stateSplit {
-				itemsplit := strings.Split(innerstate, "=")
-
-				if len(itemsplit) <= 1 {
-					log.Printf("[WARNING] No key:value: %s", innerstate)
-					continue
-				}
-
-				if itemsplit[0] == "id_token" {
-					token, err := VerifyIdToken(ctx, itemsplit[1])
-					if err != nil {
-						log.Printf("[ERROR] Bad ID token provided: %s", err)
-						resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Bad ID token provided"}`)))
-						resp.WriteHeader(401)
-						return
-					}
-
-					openidUser.Sub = token.Sub
-					openidUser.Email = token.Email
-					openidUser.Roles = token.Roles
-					org = &token.Org
-					skipValidation = true
-
-					break
-				}
-			}
-		}
-
-		if !skipValidation {
-			resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "No code specified"}`)))
-			resp.WriteHeader(401)
-			return
-		}
-	}
-
-	if !skipValidation {
-		state := request.URL.Query().Get("state")
-		if len(state) == 0 {
-			resp.WriteHeader(401)
-			resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "No state specified"}`)))
-			return
-		}
-
-		stateBase, err := base64.StdEncoding.DecodeString(state)
-		if err != nil {
-			log.Printf("[ERROR] Failed base64 decode OpenID state: %s", err)
-			resp.WriteHeader(401)
-			resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Failed base64 decoding of state"}`)))
-			return
-		}
-
-		log.Printf("State: %s", stateBase)
-		foundOrg := ""
-		foundRedir := ""
-		foundChallenge := ""
-		stateSplit := strings.Split(string(stateBase), "&")
-		for _, innerstate := range stateSplit {
-			itemsplit := strings.Split(innerstate, "=")
-			//log.Printf("Itemsplit: %s", itemsplit)
-			if len(itemsplit) <= 1 {
-				log.Printf("[WARNING] No key:value: %s", innerstate)
-				continue
-			}
-
-			if itemsplit[0] == "org" {
-				foundOrg = strings.TrimSpace(itemsplit[1])
-			}
-
-			if itemsplit[0] == "redirect" {
-				foundRedir = strings.TrimSpace(itemsplit[1])
-			}
-
-			if itemsplit[0] == "challenge" {
-				foundChallenge = strings.TrimSpace(itemsplit[1])
-			}
-		}
-
-		//log.Printf("Challenge len2: %d", len(foundChallenge))
-
-		if len(foundOrg) == 0 {
-			log.Printf("[ERROR] No org specified in state")
-			resp.WriteHeader(401)
-			resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "No org specified in state"}`)))
-			return
-		}
-
-		org, err = GetOrg(ctx, foundOrg)
-		if err != nil {
-			log.Printf("[WARNING] Error getting org in OpenID: %s", err)
-			resp.WriteHeader(401)
-			resp.Write([]byte(`{"success": false, "reason": "Couldn't find the org for sign-in in Shuffle"}`))
-			return
-		}
-
-		clientId := org.SSOConfig.OpenIdClientId
-		tokenUrl := org.SSOConfig.OpenIdToken
-		if len(tokenUrl) == 0 {
-			log.Printf("[ERROR] No token URL specified for OpenID. OrgID: %s", foundOrg)
-			resp.WriteHeader(401)
-			resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "No token URL specified in org %s. Please make sure to specify a token URL in the /admin panel in Shuffle for OpenID Connect"}`, foundOrg)))
-			return
-		}
-
-		//log.Printf("Challenge: %s", foundChallenge)
-		body, err := RunOpenidLogin(ctx, clientId, tokenUrl, foundRedir, code, foundChallenge, org.SSOConfig.OpenIdClientSecret)
-		if err != nil {
-			log.Printf("[WARNING] Error with body read of OpenID Connect: %s", err)
-			resp.WriteHeader(401)
-			resp.Write([]byte(`{"success": false}`))
-			return
-		}
-
-		openid := OpenidResp{}
-		err = json.Unmarshal(body, &openid)
-		if err != nil {
-			log.Printf("[WARNING] Error in Openid marshal: %s", err)
-			resp.WriteHeader(401)
-			resp.Write([]byte(`{"success": false}`))
-			return
-		}
-
-		if openid.IdToken == "" {
-			log.Printf("[ERROR] No id_token in OpenID token response for org %s", foundOrg)
-			resp.WriteHeader(401)
-			resp.Write([]byte(`{"success": false, "reason": "No id_token in token response. Ensure 'openid' scope is requested."}`))
-			return
-		}
-
-		unverified, err := DecodeIdTokenClaims(openid.IdToken)
-		if err != nil {
-			log.Printf("[ERROR] Failed to decode id_token: %s", err)
-			resp.WriteHeader(401)
-			resp.Write([]byte(`{"success": false, "reason": "Failed to decode id_token"}`))
-			return
-		}
-
-		idTokenClaims, err := VerifyIdTokenWithOIDC(ctx, openid.IdToken, unverified.Issuer, org.SSOConfig.OpenIdClientId)
-		if err != nil {
-			log.Printf("[ERROR] OIDC id_token verification failed: %s", err)
-			resp.WriteHeader(401)
-			resp.Write([]byte(`{"success": false, "reason": "Failed to verify id_token"}`))
-			return
-		}
-
-		openidUser.Sub = idTokenClaims.Sub
-		openidUser.Email = idTokenClaims.Email
+	openidUser, org, transaction, err := handleOpenIDCodeCallback(ctx, request)
+	if err != nil {
+		log.Printf("[ERROR] OpenID callback failed: %s", err)
+		resp.WriteHeader(401)
+		resp.Write([]byte(`{"success": false, "reason": "OpenID authentication failed"}`))
+		return
 	}
 
 	if len(openidUser.Sub) == 0 && len(openidUser.Email) == 0 {
@@ -24395,6 +24265,13 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 		for _, user := range users {
 			log.Printf("%s - %s", user.GeneratedUsername, userName)
 			if user.GeneratedUsername == userName {
+				if transaction.ExpectedUser != "" && user.Id != transaction.ExpectedUser {
+					log.Printf("[WARNING] OpenID callback for %s tried to complete login for unexpected generated user %s instead of %s", userName, user.Id, transaction.ExpectedUser)
+					resp.WriteHeader(401)
+					resp.Write([]byte(`{"success": false, "reason": "OpenID user mismatch"}`))
+					return
+				}
+
 				foundOrgInUser := false
 				for _, userOrg := range user.Orgs {
 					if userOrg == org.Id {
@@ -24430,51 +24307,16 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 					log.Printf("[AUDIT] Found user %s (%s) which matches SSO info for %s. Redirecting to login! - (1)", user.Username, user.Id, userName)
 				}
 
-				// check whether role is required for org
-
-				if org.SSOConfig.RoleRequired {
-					foundRole := false
-					for _, role := range openidUser.Roles {
-						// check whether role matches with shuffle-admin, shuffle-user or shuffle-org-reader
-						if role == "shuffle-admin" || role == "shuffle-user" || role == "shuffle-org-reader" {
-							foundRole = true
-						}
-					}
-
-					if !foundRole {
-						log.Printf("[WARNING] User %s (%s) role is missing in respone for org %s (%s). Please contact the administrator - (1)", user.Username, user.Id, org.Name, org.Id)
-						resp.WriteHeader(401)
-						resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
-						return
-					}
+				if org.SSOConfig.RoleRequired && !openIDRoleRequiredSatisfied(openidUser.Roles) {
+					log.Printf("[WARNING] User %s (%s) role is missing in respone for org %s (%s). Please contact the administrator - (1)", user.Username, user.Id, org.Name, org.Id)
+					resp.WriteHeader(401)
+					resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
+					return
 				}
-				role := user.Role
-				roleChange := false
-				if len(openidUser.Roles) > 0 {
-					for _, newRole := range openidUser.Roles {
-						if newRole == "shuffle-admin" {
-							role = "admin"
-							user.Role = "admin"
-							roleChange = true
-							break
-						}
 
-						if newRole == "shuffle-user" {
-							role = "user"
-							user.Role = "user"
-							roleChange = true
-							break
-						}
-
-						if newRole == "shuffle-org-reader" {
-							role = "org-reader"
-							user.Role = "org-reader"
-							roleChange = true
-							break
-						}
-
-					}
-				}
+				role, _ := shuffleRoleFromOpenIDRoles(openidUser.Roles)
+				roleChange := user.Role != role
+				user.Role = role
 
 				//log.Printf("SESSION: %s", user.Session)
 				user.ActiveOrg = OrgMini{
@@ -24537,17 +24379,8 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 					return
 				}
 
-				if roleChange {
-					// change user role in org if change
-					for i, usr := range org.Users {
-						if usr.Id == user.Id {
-							org.Users[i].Role = role
-							break
-						}
-					}
-				}
-
-				if !foundUserInOrg || roleChange {
+				orgRoleChange := syncOpenIDRoleToOrg(org, user.Id, role)
+				if !foundUserInOrg || roleChange || orgRoleChange {
 					err = SetOrg(ctx, *org, org.Id)
 					if err != nil {
 						log.Printf("[WARNING] Failed updating org when setting user: %s", err)
@@ -24569,6 +24402,13 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 	if err == nil && len(users) > 0 {
 		for _, user := range users {
 			if user.Username == userName {
+				if transaction.ExpectedUser != "" && user.Id != transaction.ExpectedUser {
+					log.Printf("[WARNING] OpenID callback for %s tried to complete login for unexpected user %s instead of %s", userName, user.Id, transaction.ExpectedUser)
+					resp.WriteHeader(401)
+					resp.Write([]byte(`{"success": false, "reason": "OpenID user mismatch"}`))
+					return
+				}
+
 				// Checking whether the user is in the org
 				foundOrgInUser := false
 				for _, userOrg := range user.Orgs {
@@ -24606,51 +24446,16 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 				}
 				//log.Printf("SESSION: %s", user.Session)
 
-				// check whether role is required for org
-				if org.SSOConfig.RoleRequired {
-					foundRole := false
-					for _, role := range openidUser.Roles {
-						// check whether role matches with shuffle-admin, shuffle-user or shuffle-org-reader
-						if role == "shuffle-admin" || role == "shuffle-user" || role == "shuffle-org-reader" {
-							foundRole = true
-						}
-					}
-
-					if !foundRole {
-						log.Printf("[WARNING] User %s (%s) role is missing in respone for org %s (%s). Please contact the administrator - (1)", user.Username, user.Id, org.Name, org.Id)
-						resp.WriteHeader(401)
-						resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
-						return
-					}
+				if org.SSOConfig.RoleRequired && !openIDRoleRequiredSatisfied(openidUser.Roles) {
+					log.Printf("[WARNING] User %s (%s) role is missing in respone for org %s (%s). Please contact the administrator - (1)", user.Username, user.Id, org.Name, org.Id)
+					resp.WriteHeader(401)
+					resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
+					return
 				}
 
-				role := user.Role
-				roleChange := false
-				if len(openidUser.Roles) > 0 {
-					for _, newRole := range openidUser.Roles {
-						if newRole == "shuffle-admin" {
-							role = "admin"
-							user.Role = "admin"
-							roleChange = true
-							break
-						}
-
-						if newRole == "shuffle-user" {
-							role = "user"
-							user.Role = "user"
-							roleChange = true
-							break
-						}
-
-						if newRole == "shuffle-org-reader" {
-							role = "org-reader"
-							user.Role = "org-reader"
-							roleChange = true
-							break
-						}
-
-					}
-				}
+				role, _ := shuffleRoleFromOpenIDRoles(openidUser.Roles)
+				roleChange := user.Role != role
+				user.Role = role
 
 				user.ActiveOrg = OrgMini{
 					Name: org.Name,
@@ -24711,17 +24516,8 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 					return
 				}
 
-				if roleChange {
-					// change user role in org if change
-					for i, usr := range org.Users {
-						if usr.Id == user.Id {
-							org.Users[i].Role = role
-							break
-						}
-					}
-				}
-
-				if !foundUserInOrg || roleChange {
+				orgRoleChange := syncOpenIDRoleToOrg(org, user.Id, role)
+				if !foundUserInOrg || roleChange || orgRoleChange {
 					err = SetOrg(ctx, *org, org.Id)
 					if err != nil {
 						log.Printf("[WARNING] Failed updating org when setting session: %s", err)
@@ -24770,46 +24566,14 @@ func HandleOpenId(resp http.ResponseWriter, request *http.Request) {
 		return
 	}
 
-	if org.SSOConfig.RoleRequired {
-		foundRole := false
-		for _, role := range openidUser.Roles {
-			// check whether role matches with shuffle-admin, shuffle-user or shuffle-org-reader
-			if role == "shuffle-admin" || role == "shuffle-user" || role == "shuffle-org-reader" {
-				foundRole = true
-			}
-		}
-
-		if !foundRole {
-			log.Printf("[WARNING] Role is missing in respone for  username %s. Please contact the administrator - (3)", userName)
-			resp.WriteHeader(401)
-			resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
-			return
-		}
+	if org.SSOConfig.RoleRequired && !openIDRoleRequiredSatisfied(openidUser.Roles) {
+		log.Printf("[WARNING] Role is missing in respone for  username %s. Please contact the administrator - (3)", userName)
+		resp.WriteHeader(401)
+		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Role detail is missing. Please contact the administrator of org."}`)))
+		return
 	}
 
-	// Assign default role as "user" for generated user, else assign the role from openid if available
-	// Change active org role and user.role to assign role
-	role := "user"
-	if len(openidUser.Roles) > 0 {
-		for _, newRole := range openidUser.Roles {
-			if newRole == "shuffle-admin" {
-				role = "admin"
-				break
-			}
-
-			if newRole == "shuffle-user" {
-				role = "user"
-				break
-			}
-
-			if newRole == "shuffle-org-reader" {
-				role = "org-reader"
-				break
-			}
-
-		}
-
-	}
+	role, _ := shuffleRoleFromOpenIDRoles(openidUser.Roles)
 
 	log.Printf("[AUDIT] Adding user %s with role %s to org %s (%s) through single sign-on", userName, role, org.Name, org.Id)
 
@@ -38329,7 +38093,7 @@ func opDeleteBranch(wf *Workflow, op *WorkflowOperation) error {
 	if debug {
 		log.Printf("[DEBUG] delete_branch: branch %s not found, already removed (likely cascade from delete_node) - skipping", op.ID)
 	}
-	
+
 	return nil
 }
 

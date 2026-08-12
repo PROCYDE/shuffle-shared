@@ -15251,6 +15251,10 @@ func checkImportPath() bool {
 		return false
 	}
 
+	if info.Main.Path == AllowedImportPath() {
+		return true
+	}
+
 	for _, dep := range info.Deps {
 		if strings.Contains(dep.Path, "shuffle-shared") && dep.Path != AllowedImportPath() {
 			return false
