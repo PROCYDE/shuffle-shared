@@ -127,12 +127,12 @@ func streamCacheIncrement(key string, ttlMinutes int32) (int64, error) {
 		newVal, err := mc.Increment(key, 1)
 		
 		if err == gomemcache.ErrCacheMiss {
-			addErr := mc.Add(&gomemcache.Item{
+			added, addErr := mc.Add(&gomemcache.Item{
 				Key:        key,
 				Value:      []byte("1"),
 				Expiration: ttlMinutes * 60,
 			})
-			if addErr == nil {
+			if addErr == nil && added {
 				return 1, nil
 			}
 			newVal, err = mc.Increment(key, 1)
@@ -208,12 +208,12 @@ func streamCacheSetPresence(ctx context.Context, key string, data []byte, ttlMin
 	}
 	
 	if len(memcached) > 0 && mc != nil && casID == 0 {
-		addErr := mc.Add(&gomemcache.Item{
+		added, addErr := mc.Add(&gomemcache.Item{
 			Key:        key,
 			Value:      data,
 			Expiration: ttlMinutes * 60,
 		})
-		if addErr == nil {
+		if addErr == nil && added {
 			return nil
 		}
 	}
