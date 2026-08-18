@@ -2,25 +2,23 @@ package shuffle
 
 import (
 	//"github.com/goccy/go-json"
-	"encoding/json"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"time"
-	"strconv"
-	"errors"
-	"sort"
-	"os"
-	"strings"
 	"math/rand"
-	"io/ioutil"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 
 	"cloud.google.com/go/datastore"
-	"github.com/shuffle/opensearch-go/v4/opensearchapi"
 )
 
 // A file built single-handedly for optimising executions. Functions:
-// - Fixexecution 
+// - Fixexecution
 // - Setexecution
 // - Getexecution
 
@@ -50,7 +48,7 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 
 			// Very weird edgecase handling for agent cleanup
 			// This is for auto-correctiveness of executions
-			if len(workflowExecution.Workflow.Actions) == 1 && action.Name == "agent" && innerresult.Action.Name == "agent" && innerresult.Action.ID == "" { 
+			if len(workflowExecution.Workflow.Actions) == 1 && action.Name == "agent" && innerresult.Action.Name == "agent" && innerresult.Action.ID == "" {
 				innerresult.Action.ID = action.ID
 				innerresult.Action.AppName = "AI Agent"
 			}
@@ -89,19 +87,23 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 					var cachedOutput AgentOutput
 					if err := json.Unmarshal(cachedBytes, &cachedOutput); err == nil && len(cachedOutput.Decisions) > 0 {
 						var currentOutput AgentOutput
-						_ = json.Unmarshal([]byte(innerresult.Result), &currentOutput)
-						if len(cachedOutput.Decisions) >= len(currentOutput.Decisions) || strings.Contains(innerresult.Result, "Result too large to handle") {
-							innerresult.Result = string(cachedBytes)
-							workflowExecution.Results[resultIndex].Result = string(cachedBytes)
-							if cachedOutput.Status == "FINISHED" && innerresult.Status != "SUCCESS" {
-								innerresult.Status = "SUCCESS"
-								workflowExecution.Results[resultIndex].Status = "SUCCESS"
+						if innerresult.Result != "" {
+							json.Unmarshal([]byte(innerresult.Result), &currentOutput)
+						}
+
+						if len(currentOutput.Decisions) == 0 {
+							mergedOutput := currentOutput
+							mergedOutput.Decisions = cachedOutput.Decisions
+							mergedOutput.OriginalInput = cachedOutput.OriginalInput
+
+							if newOutput, outputErr := json.Marshal(mergedOutput); outputErr == nil {
+								innerresult.Result = string(newOutput)
 							}
 						}
 					}
 				}
 
-				if workflowExecution.Status == "FINISHED" || workflowExecution.Status == "ABORTED" { 
+				if workflowExecution.Status == "FINISHED" || workflowExecution.Status == "ABORTED" {
 					//if workflowExecution.Status == "FINISHED" {
 					//	log.Printf("[DEBUG][%s] Fixexecution: Agent execution is finished, skipping agent result %s", workflowExecution.ExecutionId, innerresult.Action.ID)
 					//}
@@ -132,43 +134,43 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 					}
 				}
 
-
 				// Overwrites missing statuses
-				setFinished := mappedOutput.Status == "FINISHED" && mappedOutput.CompletedAt > 0 
+				setFinished := mappedOutput.Status == "FINISHED" && mappedOutput.CompletedAt > 0
 				finishFound := false
-				for decisionIndex, decision := range mappedOutput.Decisions { 
-					if setFinished && decision.RunDetails.Status == "" { 
+				for decisionIndex, decision := range mappedOutput.Decisions {
+					if setFinished && decision.RunDetails.Status == "" {
 						mappedOutput.Decisions[decisionIndex].RunDetails.Status = "IGNORED"
 						mappedOutput.Decisions[decisionIndex].RunDetails.CompletedAt = time.Now().UnixMilli()
 						decisionsUpdated = true
 					}
 
-					if decision.Action == "finish" || decision.Category == "finish" { 
+					if decision.Action == "finish" || decision.Category == "finish" {
 
-						if decision.RunDetails.Status != "FINISHED" {  
-							if mappedOutput.Decisions[decisionIndex].RunDetails.StartedAt == 0 { 
-								mappedOutput.Decisions[decisionIndex].RunDetails.StartedAt = time.Now().UnixMilli() 
+						if decision.RunDetails.Status != "FINISHED" {
+							if mappedOutput.Decisions[decisionIndex].RunDetails.StartedAt == 0 {
+								mappedOutput.Decisions[decisionIndex].RunDetails.StartedAt = time.Now().UnixMilli()
 							}
 
-							mappedOutput.Decisions[decisionIndex].RunDetails.CompletedAt = time.Now().UnixMilli() 
+							mappedOutput.Decisions[decisionIndex].RunDetails.CompletedAt = time.Now().UnixMilli()
 							mappedOutput.Decisions[decisionIndex].RunDetails.Status = "FINISHED"
 							decisionsUpdated = true
 						}
-				
+
 						finishFound = true
 					}
 				}
 
-				if finishFound { 
+				if finishFound {
 					mappedOutput.Status = "FINISHED"
 
 					result.Status = "SUCCESS"
 					innerresult.Status = "SUCCESS"
 					workflowExecution.Results[resultIndex].Status = "SUCCESS"
+					go sendAgentActionSelfRequest("SUCCESS", workflowExecution, workflowExecution.Results[resultIndex])
 					break
 				}
 
-				if !finishFound && (innerresult.Status == "WAITING" || innerresult.Status == "SUCCESS") || decisionsUpdated { 
+				if !finishFound && (innerresult.Status == "WAITING" || innerresult.Status == "SUCCESS") || decisionsUpdated {
 					if workflowExecution.Results[resultIndex].StartedAt == 0 {
 						workflowExecution.Results[resultIndex].StartedAt = time.Now().UnixMilli()
 					}
@@ -187,19 +189,18 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 					finishedDecisions := []string{}
 					failedFound := false
 					finishDecisionFound := false
-					timeoutTriggered := false
 					for decisionIndex, decision := range mappedOutput.Decisions {
 						if decision.Action == "finish" {
 							finishDecisionFound = true
 
-							if decision.RunDetails.Status == "" { 
+							if decision.RunDetails.Status == "" {
 								decision.RunDetails.Status = "FINISHED"
 								mappedOutput.Decisions[decisionIndex].RunDetails.Status = "FINISHED"
 							}
 						}
 
 						parsedDelay, err := strconv.Atoi(decision.Delay)
-						if err != nil { 
+						if err != nil {
 							parsedDelay = 0
 						}
 
@@ -230,7 +231,6 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 									SetCache(ctx, timeoutFlagKey, []byte("1"), 60) // 60 min TTL — long enough to outlive any recovery cycle
 
 									decisionsUpdated = true
-									timeoutTriggered = true
 									mappedOutput.Decisions[decisionIndex].RunDetails.Status = "FAILURE"
 									mappedOutput.Decisions[decisionIndex].RunDetails.CompletedAt = time.Now().UnixMilli()
 									mappedOutput.Decisions[decisionIndex].RunDetails.RawResponse += "\n[ERROR] Decision marked as FAILURE due to 5 minute timeout."
@@ -344,6 +344,11 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 							mappedOutput.CompletedAt = time.Now().UnixMilli()
 
 							workflowExecution.Results[resultIndex].Status = "SUCCESS"
+
+							go func() {
+								time.Sleep(1 * time.Second)
+								go sendAgentActionSelfRequest("SUCCESS", workflowExecution, workflowExecution.Results[resultIndex])
+							}()
 						} else {
 							mostRecentCompletion := int64(0)
 							for _, dec := range mappedOutput.Decisions {
@@ -356,7 +361,7 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 								}
 							}
 							timeSinceCompletionMs := time.Now().UnixMilli() - mostRecentCompletion
-							if timeSinceCompletionMs < 60000 && !timeoutTriggered {
+							if timeSinceCompletionMs < 60000 {
 								if debug {
 									log.Printf("[DEBUG][%s] Skipping fixexecution_timeout_recovery: last decision completed %d ms ago (waiting for LLM response from primary stream handler).", workflowExecution.ExecutionId, timeSinceCompletionMs)
 								}
@@ -386,22 +391,19 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 								time.Sleep(1 * time.Second)
 								sendAgentActionSelfRequest("WAITING", capturedExec, capturedExec.Results[resultIndex])
 								time.Sleep(2 * time.Second)
-								if project.Environment == "cloud" {
-									_, err := HandleAiAgentExecutionStart(capturedExec, capturedAction, true, "fixexecution_timeout_recovery")
-									if err != nil {
-										log.Printf("[ERROR][%s] Failed re-invoking agent after decisions completed for action %s: %s", capturedExec.ExecutionId, capturedAction.ID, err)
-									}
-								} else {
-									log.Printf("[DEBUG][%s] Skipping HandleAiAgentExecutionStart in non-cloud environment (fixexecution_timeout_recovery) — Cloud handles redeployment via queue.", capturedExec.ExecutionId)
+								_, err := HandleAiAgentExecutionStart(capturedExec, capturedAction, true, "fixexecution_timeout_recovery")
+								if err != nil {
+									log.Printf("[ERROR][%s] Failed re-invoking agent after decisions completed for action %s: %s", capturedExec.ExecutionId, capturedAction.ID, err)
 								}
 							}()
 						}
 					} else if (result.Status == "" || result.Status == "WAITING") && mappedOutput.Status == "FINISHED" {
-						if debug { 
+						if debug {
 							log.Printf("[INFO][%s] Agent action %s marked as FINISHED, updating result status to SUCCESS.", workflowExecution.ExecutionId, action.ID)
 						}
 
 						workflowExecution.Results[resultIndex].Status = "SUCCESS"
+						go sendAgentActionSelfRequest("SUCCESS", workflowExecution, workflowExecution.Results[resultIndex])
 					}
 				}
 
@@ -628,7 +630,7 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 	if (workflowExecution.Status == "WAITING" || workflowExecution.Status == "EXECUTING") && len(workflowExecution.Results) == len(workflowExecution.Workflow.Actions)+extra {
 		skipFinished := false
 		for _, result := range workflowExecution.Results {
-			if result.Status == "WAITING" || result.Status == "EXECUTING" || strings.HasPrefix(result.Status, "agent_") {
+			if result.Status == "WAITING" {
 				skipFinished = true
 				break
 			}
@@ -766,9 +768,9 @@ func SetWorkflowExecution(ctx context.Context, workflowExecution WorkflowExecuti
 	}
 
 	// FIXME: This right here has caused more problems during dev than anything
-	if (os.Getenv("SHUFFLE_SWARM_CONFIG") == "run" || project.Environment == "worker" || standalone || os.Getenv("STANDALONE") == "true") && !strings.Contains(strings.ToLower(hostname), "backend") {
+	if (os.Getenv("SHUFFLE_SWARM_CONFIG") == "run" || project.Environment == "worker") && !strings.Contains(strings.ToLower(hostname), "backend") {
 		if debug {
-			log.Printf("[DEBUG] Not saving execution to DB (just cache), since we are running in swarm or standalone mode.")
+			log.Printf("[DEBUG] Not saving execution to DB (just cache), since we are running in swarm mode (SHUFFLE_SWARM_CONFIG=run).")
 		}
 
 		return nil
@@ -780,13 +782,9 @@ func SetWorkflowExecution(ctx context.Context, workflowExecution WorkflowExecuti
 		return fmt.Errorf("[ERROR] Failed to get new execution(%s): %s", workflowExecution.ExecutionId, err)
 	}
 
-	if newexec != nil {
-		HandleExecutionCacheIncrement(ctx, *newexec)
-		if !dbSave && err == nil && (newexec.Status == "FINISHED" || newexec.Status == "ABORTED") {
-			log.Printf("[INFO][%s] Already finished (set workflow) with status %s! Stopping the rest of the request for execution.", workflowExecution.ExecutionId, newexec.Status)
-			return nil
-		}
-	} else {
+	HandleExecutionCacheIncrement(ctx, *newexec)
+	if !dbSave && err == nil && (newexec.Status == "FINISHED" || newexec.Status == "ABORTED") {
+		log.Printf("[INFO][%s] Already finished (set workflow) with status %s! Stopping the rest of the request for execution.", workflowExecution.ExecutionId, newexec.Status)
 		return nil
 	}
 
@@ -850,7 +848,11 @@ func SetWorkflowExecution(ctx context.Context, workflowExecution WorkflowExecuti
 			log.Printf("[DEBUG] Final string size of execution is: %d", len(executionData))
 		}
 
-		err = indexEs(ctx, nameKey, workflowExecution.ExecutionId, executionData)
+		err = writeExecutionDocument(ctx, workflowExecution.ExecutionId, workflowExecution.Status, executionData)
+		if err == ErrExecutionArchived {
+			log.Printf("[INFO][%s] Rejected write to archived execution", workflowExecution.ExecutionId)
+			return ErrExecutionArchived
+		}
 		if err != nil {
 			if strings.Contains(err.Error(), "immense term") {
 				retried := false
@@ -919,7 +921,7 @@ func SetWorkflowExecution(ctx context.Context, workflowExecution WorkflowExecuti
 					}
 
 					log.Printf("[DEBUG][%s] Retrying OpenSearch save after trimming remaining oversized values", workflowExecution.ExecutionId)
-					err = indexEs(ctx, nameKey, workflowExecution.ExecutionId, executionData)
+					err = writeExecutionDocument(ctx, workflowExecution.ExecutionId, workflowExecution.Status, executionData)
 				}
 			}
 
@@ -931,11 +933,6 @@ func SetWorkflowExecution(ctx context.Context, workflowExecution WorkflowExecuti
 
 		//log.Printf("[INFO] Successfully saved new execution %s. Timestamp: %d!", workflowExecution.ExecutionId, workflowExecution.StartedAt)
 	} else {
-
-		// In case of standalone runs
-		if len(project.GceProject) == 0 {
-			return nil
-		}
 
 		// Compresses and removes unecessary things
 		workflowExecution, _ := compressExecution(ctx, workflowExecution, "db-connector save")
@@ -1144,54 +1141,18 @@ func GetWorkflowExecution(ctx context.Context, id string, bypassCache ...bool) (
 		}
 	}
 
-	if (os.Getenv("SHUFFLE_SWARM_CONFIG") == "run" || project.Environment == "worker" || standalone || os.Getenv("STANDALONE") == "true") && project.Environment != "cloud" {
+	if (os.Getenv("SHUFFLE_SWARM_CONFIG") == "run" || project.Environment == "worker") && project.Environment != "cloud" {
 		return workflowExecution, errors.New("ExecutionId doesn't exist in cache")
 	}
 
 	var getErr error = nil
 	if project.DbType == "opensearch" {
-		resp, err := project.Es.Document.Get(ctx, opensearchapi.DocumentGetReq{
-			Index:      strings.ToLower(GetESIndexPrefix(nameKey)),
-			DocumentID: id,
-		})
-
-		if err != nil {
-			if strings.Contains(err.Error(), "has more than one index associated with it") {
-				fallbackExec, fallbackErr := getWorkflowExecutionByAliasSearch(ctx, strings.ToLower(GetESIndexPrefix(nameKey)), id)
-				if fallbackErr != nil {
-					log.Printf("[WARNING][%s] Error for %s: %s", workflowExecution.ExecutionId, cacheKey, err)
-					log.Printf("[WARNING][%s] WorkflowExecution alias fallback failed for %s: %s", workflowExecution.ExecutionId, cacheKey, fallbackErr)
-					return workflowExecution, fallbackErr
-				}
-
-				workflowExecution = fallbackExec
-			} else {
-				log.Printf("[WARNING][%s] Error for %s: %s", workflowExecution.ExecutionId, cacheKey, err)
-				return workflowExecution, err
-			}
+		fetched, fetchErr := getExecutionDocument(ctx, id)
+		if fetchErr != nil {
+			return workflowExecution, fetchErr
 		}
 
-		if err == nil {
-			res := resp.Inspect().Response
-			defer res.Body.Close()
-			if res.StatusCode == 404 {
-				return workflowExecution, errors.New("execution doesn't exist")
-			}
-
-			respBody, err := ioutil.ReadAll(res.Body)
-			if err != nil {
-				return workflowExecution, err
-			}
-
-			wrapped := ExecWrapper{}
-			err = json.Unmarshal(respBody, &wrapped)
-			//err = gojson.Unmarshal(respBody, &wrapped)
-			if err != nil && len(wrapped.Source.ExecutionId) == 0 {
-				return workflowExecution, err
-			}
-
-			workflowExecution = &wrapped.Source
-		}
+		workflowExecution = fetched
 	} else if len(project.GceProject) > 0 {
 		key := datastore.NameKey(nameKey, strings.ToLower(id), nil)
 		if getErr = project.Dbclient.Get(ctx, key, workflowExecution); getErr != nil {
@@ -1201,8 +1162,6 @@ func GetWorkflowExecution(ctx context.Context, id string, bypassCache ...bool) (
 				//return workflowExecution, err
 			}
 		}
-	} else {
-		return workflowExecution, errors.New("no database client configured")
 	}
 	if len(workflowExecution.ExecutionId) > 0 {
 		// A workaround for large bits of information for execution argument
