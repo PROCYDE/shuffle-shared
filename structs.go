@@ -2539,6 +2539,11 @@ type ExecutionSearchWrapper struct {
 			Source WorkflowExecution `json:"_source"`
 		} `json:"hits"`
 	} `json:"hits"`
+	Aggregations struct {
+		UniqueExecutions struct {
+			Value int `json:"value"`
+		} `json:"unique_executions"`
+	} `json:"aggregations"`
 }
 
 type OrgSearchWrapper struct {
@@ -5326,81 +5331,6 @@ type MCPToolInputSchema struct {
 	Type       string                 `json:"type"`
 	Properties map[string]MCPProperty `json:"properties"`
 	Required   []string               `json:"required"`
-}
-
-type OpensearchPrefixFixResult struct {
-	Success           bool                               `json:"success"`
-	Reason            string                             `json:"reason,omitempty"`
-	ExpectedAliases   int                                `json:"expected_aliases,omitempty"`
-	FoundAliases      int                                `json:"found_aliases,omitempty"`
-	MissingAliases    []string                           `json:"missing_aliases,omitempty"`
-	InvalidWriteAlias []string                           `json:"invalid_write_aliases,omitempty"`
-	MigrationTasks    []string                           `json:"migration_tasks,omitempty"`
-	Created           []string                           `json:"created,omitempty"`
-	WriteIndexUpdates []string                           `json:"write_index_updates,omitempty"`
-	Reindexed         []string                           `json:"reindexed,omitempty"`
-	AliasUpdates      []string                           `json:"alias_updates,omitempty"`
-	Skipped           []string                           `json:"skipped,omitempty"`
-	Counts            []OpensearchPrefixFixCountSnapshot `json:"counts,omitempty"`
-}
-
-type OpensearchPrefixFixCountSnapshot struct {
-	SourceIndex string `json:"source_index"`
-	TargetIndex string `json:"target_index"`
-	SourceDocs  int64  `json:"source_docs"`
-	TargetDocs  int64  `json:"target_docs"`
-}
-
-type OpensearchAliasResponse map[string]OpensearchAliasEntry
-
-type OpensearchAliasEntry struct {
-	Aliases map[string]json.RawMessage `json:"aliases"`
-}
-
-type OpensearchIndexInfoResponse map[string]OpensearchIndexInfo
-
-type OpensearchIndexInfo struct {
-	Settings map[string]map[string]interface{} `json:"settings"`
-	Mappings map[string]interface{}            `json:"mappings"`
-}
-
-type OpensearchReindexRequest struct {
-	Source OpensearchReindexSourceDest `json:"source"`
-	Dest   OpensearchReindexSourceDest `json:"dest"`
-}
-
-type OpensearchReindexSourceDest struct {
-	Index string `json:"index"`
-}
-
-type OpensearchAliasActionsRequest struct {
-	Actions []OpensearchAliasAction `json:"actions"`
-}
-
-type OpensearchAliasAction struct {
-	Add    *OpensearchAliasActionTarget `json:"add,omitempty"`
-	Remove *OpensearchAliasActionTarget `json:"remove,omitempty"`
-}
-
-type OpensearchAliasActionTarget struct {
-	Index        string `json:"index"`
-	Alias        string `json:"alias"`
-	IsWriteIndex *bool  `json:"is_write_index,omitempty"`
-}
-
-type OpensearchCreateIndexRequest struct {
-	Settings map[string]interface{} `json:"settings,omitempty"`
-	Mappings map[string]interface{} `json:"mappings,omitempty"`
-}
-
-type OpensearchIndexConfig struct {
-	Aliases  map[string]OpensearchIndexAliasConfig `json:"aliases,omitempty"`
-	Settings map[string]interface{}                `json:"settings,omitempty"`
-	Mappings map[string]interface{}                `json:"mappings,omitempty"`
-}
-
-type OpensearchIndexAliasConfig struct {
-	IsWriteIndex bool `json:"is_write_index,omitempty"`
 }
 
 // Only partial part of it

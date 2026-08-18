@@ -2,25 +2,23 @@ package shuffle
 
 import (
 	//"github.com/goccy/go-json"
-	"encoding/json"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"time"
-	"strconv"
-	"errors"
-	"sort"
-	"os"
-	"strings"
 	"math/rand"
-	"io/ioutil"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
 
 	"cloud.google.com/go/datastore"
-	"github.com/shuffle/opensearch-go/v4/opensearchapi"
 )
 
 // A file built single-handedly for optimising executions. Functions:
-// - Fixexecution 
+// - Fixexecution
 // - Setexecution
 // - Getexecution
 
@@ -50,7 +48,7 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 
 			// Very weird edgecase handling for agent cleanup
 			// This is for auto-correctiveness of executions
-			if len(workflowExecution.Workflow.Actions) == 1 && action.Name == "agent" && innerresult.Action.Name == "agent" && innerresult.Action.ID == "" { 
+			if len(workflowExecution.Workflow.Actions) == 1 && action.Name == "agent" && innerresult.Action.Name == "agent" && innerresult.Action.ID == "" {
 				innerresult.Action.ID = action.ID
 				innerresult.Action.AppName = "AI Agent"
 			}
@@ -76,7 +74,7 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 
 			// Special cleanup for agents
 			if innerresult.Action.AppName == "AI Agent" || innerresult.Action.AppName == "Shuffle Agent" {
-				if workflowExecution.Status == "FINISHED" || workflowExecution.Status == "ABORTED" { 
+				if workflowExecution.Status == "FINISHED" || workflowExecution.Status == "ABORTED" {
 					//if workflowExecution.Status == "FINISHED" {
 					//	log.Printf("[DEBUG][%s] Fixexecution: Agent execution is finished, skipping agent result %s", workflowExecution.ExecutionId, innerresult.Action.ID)
 					//}
@@ -125,34 +123,33 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 					}
 				}
 
-
 				// Overwrites missing statuses
-				setFinished := mappedOutput.Status == "FINISHED" && mappedOutput.CompletedAt > 0 
+				setFinished := mappedOutput.Status == "FINISHED" && mappedOutput.CompletedAt > 0
 				finishFound := false
-				for decisionIndex, decision := range mappedOutput.Decisions { 
-					if setFinished && decision.RunDetails.Status == "" { 
+				for decisionIndex, decision := range mappedOutput.Decisions {
+					if setFinished && decision.RunDetails.Status == "" {
 						mappedOutput.Decisions[decisionIndex].RunDetails.Status = "IGNORED"
 						mappedOutput.Decisions[decisionIndex].RunDetails.CompletedAt = time.Now().UnixMilli()
 						decisionsUpdated = true
 					}
 
-					if decision.Action == "finish" || decision.Category == "finish" { 
+					if decision.Action == "finish" || decision.Category == "finish" {
 
-						if decision.RunDetails.Status != "FINISHED" {  
-							if mappedOutput.Decisions[decisionIndex].RunDetails.StartedAt == 0 { 
-								mappedOutput.Decisions[decisionIndex].RunDetails.StartedAt = time.Now().UnixMilli() 
+						if decision.RunDetails.Status != "FINISHED" {
+							if mappedOutput.Decisions[decisionIndex].RunDetails.StartedAt == 0 {
+								mappedOutput.Decisions[decisionIndex].RunDetails.StartedAt = time.Now().UnixMilli()
 							}
 
-							mappedOutput.Decisions[decisionIndex].RunDetails.CompletedAt = time.Now().UnixMilli() 
+							mappedOutput.Decisions[decisionIndex].RunDetails.CompletedAt = time.Now().UnixMilli()
 							mappedOutput.Decisions[decisionIndex].RunDetails.Status = "FINISHED"
 							decisionsUpdated = true
 						}
-				
+
 						finishFound = true
 					}
 				}
 
-				if finishFound { 
+				if finishFound {
 					mappedOutput.Status = "FINISHED"
 
 					result.Status = "SUCCESS"
@@ -162,7 +159,7 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 					break
 				}
 
-				if !finishFound && (innerresult.Status == "WAITING" || innerresult.Status == "SUCCESS") || decisionsUpdated { 
+				if !finishFound && (innerresult.Status == "WAITING" || innerresult.Status == "SUCCESS") || decisionsUpdated {
 					if workflowExecution.Results[resultIndex].StartedAt == 0 {
 						workflowExecution.Results[resultIndex].StartedAt = time.Now().UnixMilli()
 					}
@@ -185,14 +182,14 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 						if decision.Action == "finish" {
 							finishDecisionFound = true
 
-							if decision.RunDetails.Status == "" { 
+							if decision.RunDetails.Status == "" {
 								decision.RunDetails.Status = "FINISHED"
 								mappedOutput.Decisions[decisionIndex].RunDetails.Status = "FINISHED"
 							}
 						}
 
 						parsedDelay, err := strconv.Atoi(decision.Delay)
-						if err != nil { 
+						if err != nil {
 							parsedDelay = 0
 						}
 
@@ -390,7 +387,7 @@ func Fixexecution(ctx context.Context, workflowExecution WorkflowExecution) (Wor
 							}()
 						}
 					} else if (result.Status == "" || result.Status == "WAITING") && mappedOutput.Status == "FINISHED" {
-						if debug { 
+						if debug {
 							log.Printf("[INFO][%s] Agent action %s marked as FINISHED, updating result status to SUCCESS.", workflowExecution.ExecutionId, action.ID)
 						}
 
@@ -840,7 +837,11 @@ func SetWorkflowExecution(ctx context.Context, workflowExecution WorkflowExecuti
 			log.Printf("[DEBUG] Final string size of execution is: %d", len(executionData))
 		}
 
-		err = indexEs(ctx, nameKey, workflowExecution.ExecutionId, executionData)
+		err = writeExecutionDocument(ctx, workflowExecution.ExecutionId, workflowExecution.Status, executionData)
+		if err == ErrExecutionArchived {
+			log.Printf("[INFO][%s] Rejected write to archived execution", workflowExecution.ExecutionId)
+			return ErrExecutionArchived
+		}
 		if err != nil {
 			if strings.Contains(err.Error(), "immense term") {
 				retried := false
@@ -909,7 +910,7 @@ func SetWorkflowExecution(ctx context.Context, workflowExecution WorkflowExecuti
 					}
 
 					log.Printf("[DEBUG][%s] Retrying OpenSearch save after trimming remaining oversized values", workflowExecution.ExecutionId)
-					err = indexEs(ctx, nameKey, workflowExecution.ExecutionId, executionData)
+					err = writeExecutionDocument(ctx, workflowExecution.ExecutionId, workflowExecution.Status, executionData)
 				}
 			}
 
@@ -1135,48 +1136,12 @@ func GetWorkflowExecution(ctx context.Context, id string, bypassCache ...bool) (
 
 	var getErr error = nil
 	if project.DbType == "opensearch" {
-		resp, err := project.Es.Document.Get(ctx, opensearchapi.DocumentGetReq{
-			Index:      strings.ToLower(GetESIndexPrefix(nameKey)),
-			DocumentID: id,
-		})
-
-		if err != nil {
-			if strings.Contains(err.Error(), "has more than one index associated with it") {
-				fallbackExec, fallbackErr := getWorkflowExecutionByAliasSearch(ctx, strings.ToLower(GetESIndexPrefix(nameKey)), id)
-				if fallbackErr != nil {
-					log.Printf("[WARNING][%s] Error for %s: %s", workflowExecution.ExecutionId, cacheKey, err)
-					log.Printf("[WARNING][%s] WorkflowExecution alias fallback failed for %s: %s", workflowExecution.ExecutionId, cacheKey, fallbackErr)
-					return workflowExecution, fallbackErr
-				}
-
-				workflowExecution = fallbackExec
-			} else {
-				log.Printf("[WARNING][%s] Error for %s: %s", workflowExecution.ExecutionId, cacheKey, err)
-				return workflowExecution, err
-			}
+		fetched, fetchErr := getExecutionDocument(ctx, id)
+		if fetchErr != nil {
+			return workflowExecution, fetchErr
 		}
 
-		if err == nil {
-			res := resp.Inspect().Response
-			defer res.Body.Close()
-			if res.StatusCode == 404 {
-				return workflowExecution, errors.New("execution doesn't exist")
-			}
-
-			respBody, err := ioutil.ReadAll(res.Body)
-			if err != nil {
-				return workflowExecution, err
-			}
-
-			wrapped := ExecWrapper{}
-			err = json.Unmarshal(respBody, &wrapped)
-			//err = gojson.Unmarshal(respBody, &wrapped)
-			if err != nil && len(wrapped.Source.ExecutionId) == 0 {
-				return workflowExecution, err
-			}
-
-			workflowExecution = &wrapped.Source
-		}
+		workflowExecution = fetched
 	} else {
 		key := datastore.NameKey(nameKey, strings.ToLower(id), nil)
 		if getErr = project.Dbclient.Get(ctx, key, workflowExecution); getErr != nil {

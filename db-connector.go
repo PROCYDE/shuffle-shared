@@ -7,7 +7,7 @@ import (
 	"crypto/sha1"
 	"crypto/tls"
 	"encoding/hex"
-	
+
 	"encoding/json"
 
 	"errors"
@@ -22,11 +22,11 @@ import (
 	"crypto/sha256"
 	"math"
 	"math/rand"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
-	"regexp"
 
 	runtimeDebug "runtime/debug"
 
@@ -76,36 +76,6 @@ type ShuffleStorage struct {
 }
 
 var maxCacheKeyLength = 250
-
-// Create ElasticSearch/OpenSearch index prefix
-// It is used where a single cluster of ElasticSearch/OpenSearch utilized by several
-// Shuffle instance
-// E.g. Instance1_Workflowapp
-func GetESIndexPrefix(index string) string {
-	prefix := os.Getenv("SHUFFLE_OPENSEARCH_INDEX_PREFIX")
-	if len(prefix) > 0 {
-		return fmt.Sprintf("%s_%s", prefix, index)
-	}
-
-	return index
-}
-
-func GetOpensearchBaseIndexes() []string {
-	return []string{
-		"workflowexecution",
-		"datastore_ngram",
-		"org_cache",
-		"org_cache_revisions",
-		"notifications",
-		"shuffle_logs",
-		"environments",
-		"org_statistics",
-		"workflowapp",
-		"workflow",
-		"workflow_revisions",
-		"datastore_category",
-	}
-}
 
 func SetOrgStatistics(ctx context.Context, stats ExecutionInfo, id string) error {
 	nameKey := "org_statistics"
@@ -401,7 +371,6 @@ func SetCache(ctx context.Context, name string, data []byte, expiration int32, u
 		}
 	}
 
-
 	// Splitting into multiple cache items
 	//if project.Environment == "cloud" || len(memcached) > 0 {
 	if len(memcached) > 0 {
@@ -602,8 +571,6 @@ func SetWorkflowAppDatastore(ctx context.Context, workflowapp WorkflowApp, id st
 
 	return nil
 }
-
-
 
 func GetEsConfig(defaultCreds bool) *opensearchapi.Client {
 	esUrl := os.Getenv("SHUFFLE_OPENSEARCH_URL")
@@ -940,54 +907,39 @@ func IncrementCacheDump(ctx context.Context, orgId, dataType string, amount ...i
 		// Get it from opensearch (may be prone to more issues at scale (thousands/second) due to no transactional locking)
 
 		id := strings.ToLower(orgId)
-		resp, err := project.Es.Document.Get(ctx, opensearchapi.DocumentGetReq{
-			Index:      strings.ToLower(GetESIndexPrefix(nameKey)),
-			DocumentID: id,
-		})
-
-		if err != nil {
-			if debug {
-				log.Printf("[WARNING] Error in org STATS get: %s", err)
-			}
-			//return err
+		data, found, getErr := getDocumentByID(ctx, strings.ToLower(GetESIndexPrefix(nameKey)), id, "last_cleared")
+		if getErr != nil {
+			log.Printf("[WARNING] Failed getting org STATS body: %s", getErr)
+			return getErr
 		}
 
-		res := resp.Inspect().Response
-		defer res.Body.Close()
-		respBody, bodyErr := ioutil.ReadAll(res.Body)
-		if err != nil || bodyErr != nil || res.StatusCode >= 300 {
-			log.Printf("[WARNING] Failed getting org STATS body: %s. Resp: %d. Body err: %s", err, res.StatusCode, bodyErr)
-
+		if !found {
 			// Init the org stats if it doesn't exist
-			if res.StatusCode == 404 {
-				orgStatistics.OrgId = orgId
-				orgStatistics = HandleIncrement(dataType, orgStatistics, dbDumpInterval)
-				orgStatistics = handleDailyCacheUpdate(orgStatistics)
+			orgStatistics.OrgId = orgId
+			orgStatistics = HandleIncrement(dataType, orgStatistics, dbDumpInterval)
+			orgStatistics = handleDailyCacheUpdate(orgStatistics)
 
-				marshalledData, err := json.Marshal(orgStatistics)
-				if err != nil {
-					log.Printf("[ERROR] Failed marshalling org STATS body: %s", err)
+			marshalledData, marshalErr := json.Marshal(orgStatistics)
+			if marshalErr != nil {
+				log.Printf("[ERROR] Failed marshalling org STATS body: %s", marshalErr)
+			} else {
+				if indexErr := indexEs(ctx, nameKey, id, marshalledData); indexErr != nil {
+					log.Printf("[ERROR] Failed indexing org STATS body: %s", indexErr)
 				} else {
-					err := indexEs(ctx, nameKey, id, marshalledData)
-					if err != nil {
-						log.Printf("[ERROR] Failed indexing org STATS body: %s", err)
-					} else {
-						log.Printf("[DEBUG] Indexed org STATS body for %s", orgId)
-					}
+					log.Printf("[DEBUG] Indexed org STATS body for %s", orgId)
 				}
 			}
 
-			return err
+			return nil
 		}
 
-		orgStatsWrapper := &ExecutionInfoWrapper{}
-		err = json.Unmarshal(respBody, &orgStatsWrapper)
-		if err != nil {
-			log.Printf("[ERROR] Failed unmarshalling org STATS body: %s", err)
-			return err
+		source := ExecutionInfo{}
+		if unmarshalErr := json.Unmarshal(data, &source); unmarshalErr != nil {
+			log.Printf("[ERROR] Failed unmarshalling org STATS body: %s", unmarshalErr)
+			return unmarshalErr
 		}
 
-		orgStatistics = &orgStatsWrapper.Source
+		orgStatistics = &source
 		if orgStatistics.OrgName == "" || orgStatistics.OrgName == orgStatistics.OrgId {
 			org, err := GetOrg(ctx, orgId)
 			if err == nil {
@@ -1007,9 +959,8 @@ func IncrementCacheDump(ctx context.Context, orgId, dataType string, amount ...i
 			return err
 		}
 
-		err = indexEs(ctx, nameKey, id, marshalledData)
-		if err != nil {
-			log.Printf("[ERROR] Failed indexing org STATS body (2): %s", err)
+		if indexErr := indexEs(ctx, nameKey, id, marshalledData); indexErr != nil {
+			log.Printf("[ERROR] Failed indexing org STATS body (2): %s", indexErr)
 		}
 
 		//log.Printf("[DEBUG] Incremented org stats for %s", orgId)
@@ -1551,11 +1502,11 @@ func getExecutionFileValue(ctx context.Context, workflowExecution WorkflowExecut
 		obj := bucket.Object(fullParsedPath)
 		fileReader, err := obj.NewReader(ctx)
 		if err != nil {
-			if debug { 
+			if debug {
 				log.Printf("[DEBUG] Failed reading file '%s' from bucket %s: %s. Will try with alternative solution.", fullParsedPath, bucketName, err)
 			}
 
-			// Cache sip for the minute 
+			// Cache sip for the minute
 			SetCache(ctx, cacheKey, []byte{}, 1)
 
 			if projectName != "shuffler" {
@@ -1565,7 +1516,7 @@ func getExecutionFileValue(ctx context.Context, workflowExecution WorkflowExecut
 				fileReader, err = obj.NewReader(ctx)
 				if err != nil {
 					//log.Printf("[ERROR] Failed reading file '%s' again from bucket %s: %s", fullParsedPath, bucketName, err)
-		
+
 					return "", err
 				}
 			} else {
@@ -2469,11 +2420,11 @@ func GetEnvironment(ctx context.Context, id, orgId string) (*Environment, error)
 			if err == nil {
 
 				timenow := time.Now().Unix()
-				if env.SensorGroup { 
+				if env.SensorGroup {
 					for sensorIndex, _ := range env.SensorHosts {
 						sensor := env.SensorHosts[sensorIndex]
-							
-						env.SensorHosts[sensorIndex].Active = false 
+
+						env.SensorHosts[sensorIndex].Active = false
 						if sensor.Checkin > 0 && timenow-sensor.Checkin < 300 {
 							env.SensorHosts[sensorIndex].Active = true
 						}
@@ -2610,11 +2561,11 @@ func GetEnvironment(ctx context.Context, id, orgId string) (*Environment, error)
 	}
 
 	timenow := time.Now().Unix()
-	if env.SensorGroup { 
+	if env.SensorGroup {
 		for sensorIndex, _ := range env.SensorHosts {
 			sensor := env.SensorHosts[sensorIndex]
-				
-			env.SensorHosts[sensorIndex].Active = false 
+
+			env.SensorHosts[sensorIndex].Active = false
 			if sensor.Checkin > 0 && timenow-sensor.Checkin < 300 {
 				env.SensorHosts[sensorIndex].Active = true
 			}
@@ -2660,6 +2611,10 @@ func GetWorkflowRunCount(ctx context.Context, id string, start int64, end int64)
 
 	if project.DbType == "opensearch" {
 		// count WorkflowExecution where workflowId = id
+		// Uses a cardinality aggregation on execution_id instead of
+		// track_total_hits so a duplicate _id across live+archive (the narrow
+		// crash/sweep-race window described in execution_lifecycle.go) is
+		// counted once, not twice.
 		query := map[string]interface{}{
 			"size": 0,
 			"query": map[string]interface{}{
@@ -2681,6 +2636,13 @@ func GetWorkflowRunCount(ctx context.Context, id string, start int64, end int64)
 					},
 				},
 			},
+			"aggs": map[string]interface{}{
+				"unique_executions": map[string]interface{}{
+					"cardinality": map[string]interface{}{
+						"field": "execution_id",
+					},
+				},
+			},
 		}
 
 		var buf bytes.Buffer
@@ -2690,10 +2652,11 @@ func GetWorkflowRunCount(ctx context.Context, id string, start int64, end int64)
 		}
 
 		resp, err := project.Es.Search(ctx, &opensearchapi.SearchReq{
-			Indices: []string{strings.ToLower(GetESIndexPrefix(nameKey))},
+			Indices: executionSearchIndices(),
 			Body:    &buf,
 			Params: opensearchapi.SearchParams{
-				TrackTotalHits: true,
+				AllowNoIndices:    opensearchapi.ToPointer(true),
+				IgnoreUnavailable: opensearchapi.ToPointer(true),
 			},
 		})
 
@@ -2742,7 +2705,7 @@ func GetWorkflowRunCount(ctx context.Context, id string, start int64, end int64)
 			return 0, err
 		}
 
-		count = wrapped.Hits.Total.Value
+		count = wrapped.Aggregations.UniqueExecutions.Value
 	} else {
 		// count WorkflowExecution where workflowId = id
 		//query := datastore.NewQuery(nameKey).Filter("workflow_id =", strings.ToLower(id))
@@ -3257,43 +3220,20 @@ func GetOrgStatistics(ctx context.Context, orgId string) (*ExecutionInfo, error)
 	if project.DbType == "opensearch" {
 		shouldInitializeStats := false
 
-		resp, err := project.Es.Document.Get(ctx, opensearchapi.DocumentGetReq{
-			Index:      strings.ToLower(GetESIndexPrefix(nameKey)),
-			DocumentID: orgId,
-		})
-
-		if err != nil && !strings.Contains(err.Error(), "status: 404") {
+		data, found, err := getDocumentByID(ctx, strings.ToLower(GetESIndexPrefix(nameKey)), orgId, "last_cleared")
+		if err != nil {
 			log.Printf("[WARNING] Error for %s: %s", cacheKey, err)
 			return stats, err
 		}
 
-		if err != nil && strings.Contains(err.Error(), "status: 404") {
+		if !found {
 			shouldInitializeStats = true
-		}
-
-		if !shouldInitializeStats {
-			res := resp.Inspect().Response
-			defer res.Body.Close()
-			if res.StatusCode == 404 {
-				shouldInitializeStats = true
-			} else {
-				respBody, err := ioutil.ReadAll(res.Body)
-				if err != nil {
-					return stats, err
-				}
-
-				wrapped := ExecutionInfoWrapper{}
-				err = json.Unmarshal(respBody, &wrapped)
-				if err != nil {
-					return stats, err
-				}
-
-				if !wrapped.Found {
-					shouldInitializeStats = true
-				} else {
-					stats = &wrapped.Source
-				}
+		} else {
+			source := ExecutionInfo{}
+			if unmarshalErr := json.Unmarshal(data, &source); unmarshalErr != nil {
+				return stats, unmarshalErr
 			}
+			stats = &source
 		}
 
 		if shouldInitializeStats {
@@ -3625,7 +3565,7 @@ func GetAllWorkflowsByQuery(ctx context.Context, user User, maxAmount int, curso
 				_, err = it.Next(&innerWorkflow)
 				if err != nil {
 					if strings.Contains(fmt.Sprintf("%s", err), "cannot load field") {
-						if debug { 
+						if debug {
 							//log.Printf("[DEBUG] Workflow load iterator issue: %s", err)
 						}
 
@@ -3639,7 +3579,7 @@ func GetAllWorkflowsByQuery(ctx context.Context, user User, maxAmount int, curso
 				}
 
 				if innerWorkflow.Public {
-					//if debug { 
+					//if debug {
 					//	log.Printf("[DEBUG] Skipping public workflow %s (%s) for org %s", innerWorkflow.Name, innerWorkflow.ID, user.ActiveOrg.Id)
 					//}
 
@@ -3647,7 +3587,7 @@ func GetAllWorkflowsByQuery(ctx context.Context, user User, maxAmount int, curso
 				}
 
 				if innerWorkflow.Hidden {
-					//if debug { 
+					//if debug {
 					//	log.Printf("[DEBUG] Skipping HIDDEN workflow %s (%s) for org %s", innerWorkflow.Name, innerWorkflow.ID, user.ActiveOrg.Id)
 					//}
 
@@ -3671,12 +3611,12 @@ func GetAllWorkflowsByQuery(ctx context.Context, user User, maxAmount int, curso
 				}
 			}
 
-			// Fallback for when the iterator fails due to a datastore issue 
+			// Fallback for when the iterator fails due to a datastore issue
 			// (e.g. "cannot load field" error) and similar
 			if err != iterator.Done {
 				log.Printf("[WARNING] Failed fetching workflow results for org %s: %v", user.ActiveOrg.Id, err)
 
-				// Check if query contains edited or not 
+				// Check if query contains edited or not
 				if strings.Contains(fmt.Sprintf("%s", err), "FailedPrecondition desc") && strings.Contains(fmt.Sprintf("%s", query), "edited") {
 					log.Printf("[ERROR] Retrying workflow query without Edited sort due to error: %s", err)
 
@@ -3712,7 +3652,7 @@ func GetAllWorkflowsByQuery(ctx context.Context, user User, maxAmount int, curso
 	})
 
 	if len(workflows) > maxAmount {
-		if debug { 
+		if debug {
 			log.Printf("[WARNING] Found %d workflows for user %s (%s) in org %s, but limiting to %d", len(workflows), user.Username, user.Id, user.ActiveOrg.Id, maxAmount)
 		}
 
@@ -6478,11 +6418,11 @@ func GetEnvironments(ctx context.Context, orgId string) ([]Environment, error) {
 
 				timenow := time.Now().Unix()
 				for envIndex, env := range environments {
-					if env.SensorGroup { 
+					if env.SensorGroup {
 						for sensorIndex, _ := range env.SensorHosts {
 							sensor := env.SensorHosts[sensorIndex]
-								
-							environments[envIndex].SensorHosts[sensorIndex].Active = false 
+
+							environments[envIndex].SensorHosts[sensorIndex].Active = false
 							if sensor.Checkin > 0 && timenow-sensor.Checkin < 300 {
 								environments[envIndex].SensorHosts[sensorIndex].Active = true
 							}
@@ -6661,11 +6601,11 @@ func GetEnvironments(ctx context.Context, orgId string) ([]Environment, error) {
 	timenow := time.Now().Unix()
 	for envIndex, env := range environments {
 
-		if env.SensorGroup { 
+		if env.SensorGroup {
 			for sensorIndex, _ := range env.SensorHosts {
 				sensor := env.SensorHosts[sensorIndex]
-					
-				environments[envIndex].SensorHosts[sensorIndex].Active = false 
+
+				environments[envIndex].SensorHosts[sensorIndex].Active = false
 				if sensor.Checkin > 0 && timenow-sensor.Checkin < 300 {
 					environments[envIndex].SensorHosts[sensorIndex].Active = true
 				}
@@ -10143,7 +10083,7 @@ func GetApikey(ctx context.Context, apikey string) (User, error) {
 	}
 
 	if debug {
-		log.Printf("[DEBUG] API key cache miss; looking up user") 
+		log.Printf("[DEBUG] API key cache miss; looking up user")
 	}
 
 	if project.DbType == "opensearch" {
@@ -10462,34 +10402,20 @@ func GetNotification(ctx context.Context, id string) (*Notification, error) {
 	cacheKey := fmt.Sprintf("%s_%s", nameKey, id)
 	curFile := &Notification{}
 	if project.DbType == "opensearch" {
-		//log.Printf("GETTING ES USER %s",
-		resp, err := project.Es.Document.Get(ctx, opensearchapi.DocumentGetReq{
-			Index:      strings.ToLower(GetESIndexPrefix(nameKey)),
-			DocumentID: id,
-		})
+		data, found, err := getDocumentByID(ctx, strings.ToLower(GetESIndexPrefix(nameKey)), id, "updated_at")
 		if err != nil {
 			log.Printf("[WARNING] Error for %s: %s", cacheKey, err)
 			return &Notification{}, err
 		}
-
-		res := resp.Inspect().Response
-		defer res.Body.Close()
-		if res.StatusCode == 404 {
+		if !found {
 			return &Notification{}, errors.New("Notification with that ID doesn't exist")
 		}
 
-		respBody, err := ioutil.ReadAll(res.Body)
-		if err != nil {
-			return &Notification{}, err
+		source := Notification{}
+		if unmarshalErr := json.Unmarshal(data, &source); unmarshalErr != nil {
+			return &Notification{}, unmarshalErr
 		}
-
-		wrapped := NotificationWrapper{}
-		err = json.Unmarshal(respBody, &wrapped)
-		if err != nil {
-			return &Notification{}, err
-		}
-
-		curFile = &wrapped.Source
+		curFile = &source
 	} else {
 		key := datastore.NameKey(nameKey, id, nil)
 		if err := project.Dbclient.Get(ctx, key, curFile); err != nil {
@@ -12061,7 +11987,8 @@ func GetUnfinishedExecutions(ctx context.Context, workflowId string) ([]Workflow
 			"size": 1000,
 			"sort": map[string]interface{}{
 				"started_at": map[string]interface{}{
-					"order": "desc",
+					"order":         "desc",
+					"unmapped_type": "long",
 				},
 			},
 			"query": map[string]interface{}{
@@ -12089,18 +12016,15 @@ func GetUnfinishedExecutions(ctx context.Context, workflowId string) ([]Workflow
 
 		// Perform the search request.
 		resp, err := project.Es.Search(ctx, &opensearchapi.SearchReq{
-			Indices: []string{strings.ToLower(GetESIndexPrefix(nameKey))},
+			Indices: executionSearchIndices(),
 			Body:    &buf,
 			Params: opensearchapi.SearchParams{
-				TrackTotalHits: true,
+				TrackTotalHits:    true,
+				AllowNoIndices:    opensearchapi.ToPointer(true),
+				IgnoreUnavailable: opensearchapi.ToPointer(true),
 			},
 		})
 		if err != nil {
-			if strings.Contains(err.Error(), "index_not_found_exception") {
-				return executions, nil
-			}
-
-			log.Printf("[ERROR] Error getting response from Opensearch (get workflow executions): %s", err)
 			return executions, err
 		}
 
@@ -12144,6 +12068,7 @@ func GetUnfinishedExecutions(ctx context.Context, workflowId string) ([]Workflow
 		for _, hit := range wrapped.Hits.Hits {
 			executions = append(executions, hit.Source)
 		}
+		executions = dedupExecutionsByID(executions)
 
 		return executions, nil
 	} else {
@@ -12276,7 +12201,8 @@ func GetAllWorkflowExecutionsV2(ctx context.Context, workflowId string, amount i
 			},
 			"sort": map[string]interface{}{
 				"started_at": map[string]interface{}{
-					"order": "desc",
+					"order":         "desc",
+					"unmapped_type": "long",
 				},
 			},
 		}
@@ -12287,10 +12213,12 @@ func GetAllWorkflowExecutionsV2(ctx context.Context, workflowId string, amount i
 
 		// Perform the search request.
 		resp, err := project.Es.Search(ctx, &opensearchapi.SearchReq{
-			Indices: []string{strings.ToLower(GetESIndexPrefix(nameKey))},
+			Indices: executionSearchIndices(),
 			Body:    &buf,
 			Params: opensearchapi.SearchParams{
-				TrackTotalHits: true,
+				TrackTotalHits:    true,
+				AllowNoIndices:    opensearchapi.ToPointer(true),
+				IgnoreUnavailable: opensearchapi.ToPointer(true),
 			},
 		})
 		if err != nil {
@@ -12344,6 +12272,7 @@ func GetAllWorkflowExecutionsV2(ctx context.Context, workflowId string, amount i
 				executions = append(executions, hit.Source)
 			}
 		}
+		executions = dedupExecutionsByID(executions)
 
 	} else {
 		query := datastore.NewQuery(nameKey).Filter("workflow_id =", workflowId).Order("-started_at").Limit(5)
@@ -12665,7 +12594,8 @@ func GetAllWorkflowExecutions(ctx context.Context, workflowId string, amount int
 			},
 			"sort": map[string]interface{}{
 				"started_at": map[string]interface{}{
-					"order": "desc",
+					"order":         "desc",
+					"unmapped_type": "long",
 				},
 			},
 		}
@@ -12676,10 +12606,12 @@ func GetAllWorkflowExecutions(ctx context.Context, workflowId string, amount int
 
 		// Perform the search request.
 		resp, err := project.Es.Search(ctx, &opensearchapi.SearchReq{
-			Indices: []string{strings.ToLower(GetESIndexPrefix(nameKey))},
+			Indices: executionSearchIndices(),
 			Body:    &buf,
 			Params: opensearchapi.SearchParams{
-				TrackTotalHits: true,
+				TrackTotalHits:    true,
+				AllowNoIndices:    opensearchapi.ToPointer(true),
+				IgnoreUnavailable: opensearchapi.ToPointer(true),
 			},
 		})
 		if err != nil {
@@ -12733,6 +12665,7 @@ func GetAllWorkflowExecutions(ctx context.Context, workflowId string, amount int
 				executions = append(executions, hit.Source)
 			}
 		}
+		executions = dedupExecutionsByID(executions)
 
 		//return executions, nil
 	} else {
@@ -13834,7 +13767,7 @@ func SetDatastoreKeyBulk(ctx context.Context, allKeys []CacheKeyData) ([]Datasto
 							oldDoc := config.Value
 							newDoc := cacheData.Value
 
-							if debug { 
+							if debug {
 								log.Printf("\n\nOLD: %s\n\nNEW: %s\n\n", oldDoc, newDoc)
 							}
 
@@ -13859,9 +13792,9 @@ func SetDatastoreKeyBulk(ctx context.Context, allKeys []CacheKeyData) ([]Datasto
 						break
 					}
 
-					// This NEVER triggers. RLS just returns the merged JSON 
-					// and we trust it. If we don't trust it, we can set 
-					// ruleValid to false above. 
+					// This NEVER triggers. RLS just returns the merged JSON
+					// and we trust it. If we don't trust it, we can set
+					// ruleValid to false above.
 					if !ruleValid {
 						// Break out
 						if debug {
@@ -13870,8 +13803,8 @@ func SetDatastoreKeyBulk(ctx context.Context, allKeys []CacheKeyData) ([]Datasto
 
 						keyUpdated = false
 
-						cacheData.Existed = true 
-						cacheData.Changed = keyUpdated 
+						cacheData.Existed = true
+						cacheData.Changed = keyUpdated
 						datastoreKeys <- *datastore.NameKey(nameKey, datastoreId, nil)
 						cacheKeys <- cacheData
 						return
@@ -14216,7 +14149,7 @@ func SetDatastoreKeyBulk(ctx context.Context, allKeys []CacheKeyData) ([]Datasto
 	}
 
 	if len(newArray) > 0 {
-		if debug { 
+		if debug {
 			log.Printf("[INFO] SetDatastoreKeyBulk: Successfully set %d key(s) in category %s for org %s", len(newArray), mainCategory, orgId)
 		}
 	}
@@ -15138,6 +15071,130 @@ func getCacheKeyByAliasSearch(ctx context.Context, aliasName, id string) (*Cache
 
 	item := wrapped.Hits.Hits[0].Source
 	return &item, nil
+}
+
+type esDocGetWrapper struct {
+	Found  bool            `json:"found"`
+	Source json.RawMessage `json:"_source"`
+}
+
+type esSearchDocWrapper struct {
+	Hits struct {
+		Hits []struct {
+			Source json.RawMessage `json:"_source"`
+		} `json:"hits"`
+	} `json:"hits"`
+}
+
+// buildAliasSearchBody builds an ids _search query for a single document. When
+// sortField is non-empty the result is ordered desc on that field so the most
+// recent generation wins when an alias spans multiple backing indices.
+func buildAliasSearchBody(sortField, id string) ([]byte, error) {
+	query := map[string]interface{}{
+		"size": 1,
+		"query": map[string]interface{}{
+			"ids": map[string]interface{}{
+				"values": []string{id},
+			},
+		},
+	}
+
+	if sortField != "" {
+		query["sort"] = []map[string]interface{}{
+			{
+				sortField: map[string]interface{}{
+					"order":         "desc",
+					"unmapped_type": "long",
+				},
+			},
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(query); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+// getDocumentByID fetches a document by id from an OpenSearch index/alias and
+// returns its raw _source. If the target is a rollover alias spanning more than
+// one backing index (which fails for a single-document get), it falls back to an
+// ids _search across the alias (optionally sorted so the newest generation wins).
+// found=false with err=nil means the document does not exist.
+func getDocumentByID(ctx context.Context, indexName, id, sortField string) (doc []byte, found bool, err error) {
+	resp, err := project.Es.Document.Get(ctx, opensearchapi.DocumentGetReq{
+		Index:      indexName,
+		DocumentID: id,
+	})
+
+	if err != nil {
+		if strings.Contains(err.Error(), "status: 404") {
+			return nil, false, nil
+		}
+
+		if !strings.Contains(err.Error(), "has more than one index associated with it") {
+			return nil, false, err
+		}
+
+		// Alias spans multiple backing indices: fall back to an ids search.
+		body, buildErr := buildAliasSearchBody(sortField, id)
+		if buildErr != nil {
+			return nil, false, buildErr
+		}
+
+		searchResp, searchErr := project.Es.Search(ctx, &opensearchapi.SearchReq{
+			Indices: []string{indexName},
+			Body:    bytes.NewReader(body),
+			Params:  opensearchapi.SearchParams{TrackTotalHits: true},
+		})
+		if searchErr != nil {
+			return nil, false, searchErr
+		}
+
+		searchRes := searchResp.Inspect().Response
+		defer searchRes.Body.Close()
+
+		respBody, readErr := ioutil.ReadAll(searchRes.Body)
+		if readErr != nil {
+			return nil, false, readErr
+		}
+		if searchRes.StatusCode != 200 && searchRes.StatusCode != 201 {
+			return nil, false, fmt.Errorf("failed alias fallback lookup. status=%d body=%s", searchRes.StatusCode, string(respBody))
+		}
+
+		wrapped := esSearchDocWrapper{}
+		if unmarshalErr := json.Unmarshal(respBody, &wrapped); unmarshalErr != nil {
+			return nil, false, unmarshalErr
+		}
+		if len(wrapped.Hits.Hits) == 0 {
+			return nil, false, nil
+		}
+
+		return wrapped.Hits.Hits[0].Source, true, nil
+	}
+
+	res := resp.Inspect().Response
+	defer res.Body.Close()
+	if res.StatusCode >= 300 {
+		return nil, false, fmt.Errorf("failed document get. status=%d", res.StatusCode)
+	}
+
+	respBody, readErr := ioutil.ReadAll(res.Body)
+	if readErr != nil {
+		return nil, false, readErr
+	}
+
+	wrapped := esDocGetWrapper{}
+	if unmarshalErr := json.Unmarshal(respBody, &wrapped); unmarshalErr != nil {
+		return nil, false, unmarshalErr
+	}
+	if !wrapped.Found {
+		return nil, false, nil
+	}
+
+	return wrapped.Source, true, nil
 }
 
 var retryCount int
@@ -17683,7 +17740,8 @@ func GetWorkflowRunsBySearch(ctx context.Context, orgId string, search WorkflowS
 			},
 			"sort": map[string]interface{}{
 				"started_at": map[string]interface{}{
-					"order": "desc",
+					"order":         "desc",
+					"unmapped_type": "long",
 				},
 			},
 		}
@@ -17784,10 +17842,12 @@ func GetWorkflowRunsBySearch(ctx context.Context, orgId string, search WorkflowS
 
 		// Perform the search request.
 		resp, err := project.Es.Search(ctx, &opensearchapi.SearchReq{
-			Indices: []string{strings.ToLower(GetESIndexPrefix(nameKey))},
+			Indices: executionSearchIndices(),
 			Body:    &buf,
 			Params: opensearchapi.SearchParams{
-				TrackTotalHits: true,
+				TrackTotalHits:    true,
+				AllowNoIndices:    opensearchapi.ToPointer(true),
+				IgnoreUnavailable: opensearchapi.ToPointer(true),
 			},
 		})
 
@@ -17822,6 +17882,10 @@ func GetWorkflowRunsBySearch(ctx context.Context, orgId string, search WorkflowS
 		for _, hit := range wrapped.Hits.Hits {
 			executions = append(executions, hit.Source)
 		}
+		// Searching both workflowexecution_live and workflowexecution (archive)
+		// can surface the same execution_id twice in the narrow window between
+		// an unarchive write and its archive-side delete; dedupe defensively.
+		executions = dedupExecutionsByID(executions)
 
 		//return executions, "", errors.New("Not implemented yet")
 	} else {
@@ -18713,33 +18777,20 @@ func GetDatastoreNGramItem(ctx context.Context, key string) (*NGramItem, error) 
 	}
 
 	if project.DbType == "opensearch" {
-		resp, err := project.Es.Document.Get(ctx, opensearchapi.DocumentGetReq{
-			Index:      strings.ToLower(GetESIndexPrefix(nameKey)),
-			DocumentID: key,
-		})
+		data, found, err := getDocumentByID(ctx, strings.ToLower(GetESIndexPrefix(nameKey)), key, "")
 		if err != nil {
 			log.Printf("[WARNING] Error for %s: %s", cacheKey, err)
 			return ngramItem, err
 		}
-
-		res := resp.Inspect().Response
-		defer res.Body.Close()
-		if res.StatusCode == 404 {
+		if !found {
 			return ngramItem, errors.New("Item doesn't exist")
 		}
 
-		respBody, err := ioutil.ReadAll(res.Body)
-		if err != nil {
-			return ngramItem, err
+		source := NGramItem{}
+		if unmarshalErr := json.Unmarshal(data, &source); unmarshalErr != nil {
+			return ngramItem, unmarshalErr
 		}
-
-		wrapped := NgramItemWrapper{}
-		err = json.Unmarshal(respBody, &wrapped)
-		if err != nil {
-			return ngramItem, err
-		}
-
-		ngramItem = &wrapped.Source
+		ngramItem = &source
 	} else {
 		// Get the ngram item from the datastore
 		getNgramKey := datastore.NameKey(nameKey, key, nil)
@@ -18794,448 +18845,26 @@ func HealthCheckHandler(resp http.ResponseWriter, request *http.Request) {
 	//fmt.Fprint(res, "OK")
 }
 
-func InitOpensearchIndexes() {
+// StartExecutionLifecycleJobs starts the background jobs that keep
+// workflowexecution_live bounded.
+func StartExecutionLifecycleJobs(ctx context.Context) {
 	if project.DbType != "opensearch" {
 		return
 	}
 
-	if os.Getenv("SHUFFLE_SKIP_OPENSEARCH_INDEX_INIT") == "true" {
-		return
+	if strings.ToLower(os.Getenv("SHUFFLE_SKIP_EXECUTION_LIVE_MIGRATION")) == "true" {
+		log.Printf("[INFO] Skipping in-flight execution migration to workflowexecution_live (SHUFFLE_SKIP_EXECUTION_LIVE_MIGRATION=true)")
+	} else if err := migrateInFlightExecutionsToLive(ctx); err != nil {
+		log.Printf("[WARNING] Failed migrating in-flight executions to live index: %s", err)
 	}
 
-	// Check if the "workflowexecution" index exists and configuring rollovers if possible
-	log.Printf("[INFO] Configuring Opensearch indexes for scaling")
-
-	ctx := context.Background()
-	opensearchUrl := strings.TrimRight(os.Getenv("SHUFFLE_OPENSEARCH_URL"), "/")
-	if len(opensearchUrl) == 0 {
-		opensearchUrl = "https://shuffle-opensearch:9200"
-	}
-
-	relevantScaleIndexes := []string{}
-	for _, baseIndex := range GetOpensearchBaseIndexes() {
-		relevantScaleIndexes = append(relevantScaleIndexes, GetESIndexPrefix(baseIndex))
-	}
-
-	customConfig := os.Getenv("OPENSEARCH_INDEX_CONFIG")
-	if len(customConfig) > 0 {
-		checkValidJson := map[string]interface{}{}
-		if err := json.Unmarshal([]byte(customConfig), &checkValidJson); err != nil {
-			log.Printf("[ERROR] Invalid JSON in OPENSEARCH_INDEX_CONFIG: %s", err)
-			customConfig = ""
-		}
-
-		log.Printf("[DEBUG] Using custom index config for relevant scale indexes: %s", customConfig)
-	}
-
-	customRollover := os.Getenv("OPENSEARCH_INDEX_ROLLOVER")
-	if len(customRollover) > 0 {
-		checkValidJson := map[string]interface{}{}
-		if err := json.Unmarshal([]byte(customRollover), &checkValidJson); err != nil {
-			log.Printf("[ERROR] Invalid JSON in OPENSEARCH_INDEX_ROLLOVER: %s", err)
-			customRollover = ""
-		}
-
-		log.Printf("[DEBUG] Using custom rollover config for relevant scale indexes: %s", customRollover)
-	}
-
-	rolloverConfig := []byte(fmt.Sprintf(`{
-		"conditions": {
-			"max_age": "90d",
-			"max_size": "40gb",
-			"max_docs": 1000000
-		}
-	}`))
-
-	if len(customRollover) > 0 {
-		rolloverConfig = []byte(customRollover)
-	}
-
-	ismEnabled := strings.ToLower(strings.TrimSpace(os.Getenv("OPENSEARCH_USE_ISM_ROLLOVER"))) != "false"
-	ismPolicyName := strings.TrimSpace(os.Getenv("OPENSEARCH_ISM_POLICY_NAME"))
-	if ismPolicyName == "" {
-		ismPolicyName = "shuffle-rollover"
-	}
-
-	ismReady := false
-	if ismEnabled {
-		var err error
-		ismReady, err = ensureOpensearchISMRolloverPolicy(ctx, opensearchUrl, relevantScaleIndexes, rolloverConfig, ismPolicyName)
-		if err != nil {
-			log.Printf("[WARNING] Failed ensuring ISM rollover policy '%s': %s", ismPolicyName, err)
-		}
-	}
-
-	if fixResult, fixErr := FixOpensearchIndexPrefix(ctx); fixErr != nil {
-		log.Printf("[WARNING] Prefix repair before init failed: %s", fixErr)
-	} else if !fixResult.Success {
-		log.Printf("[WARNING] Prefix repair before init completed with verification warnings: %s", fixResult.Reason)
+	if strings.ToLower(os.Getenv("SHUFFLE_SKIP_EXECUTION_ARCHIVAL_SWEEP")) == "true" {
+		log.Printf("[WARNING] Execution archival sweep disabled (SHUFFLE_SKIP_EXECUTION_ARCHIVAL_SWEEP=true) - workflowexecution_live will grow unbounded")
 	} else {
-		log.Printf("[INFO] Prefix repair before init: expected aliases=%d found=%d", fixResult.ExpectedAliases, fixResult.FoundAliases)
+		go StartExecutionArchivalSweeper(context.Background())
 	}
 
-	for _, index := range relevantScaleIndexes {
-		indexConfig := []byte(fmt.Sprintf(`{
-			"aliases": {
-				"%s": {
-					"is_write_index": true
-				}
-			},
-			"settings": {
-				"number_of_shards": 3,
-				"number_of_replicas": 1,
-				"refresh_interval": "30s"
-			},
-			"mappings": {
-				"dynamic_templates": [
-					{
-						"strings_as_keywords": {
-							"match_mapping_type": "string",
-							"mapping": {
-								"type": "keyword"
-							}
-						}
-					}
-				]
-			}
-		}`, index))
-
-		if len(customConfig) > 0 {
-			indexConfig = []byte(customConfig)
-
-			// Check if alias is in the index or not, otherwise inject it
-			unmarshalled := map[string]interface{}{}
-			if err := json.Unmarshal(indexConfig, &unmarshalled); err != nil {
-				log.Printf("[ERROR] Invalid JSON in OPENSEARCH_INDEX_CONFIG (2): %s", err)
-			} else {
-				if _, ok := unmarshalled["aliases"]; !ok {
-					// Inject it
-					aliasPart := map[string]interface{}{
-						index: map[string]bool{
-							"is_write_index": true,
-						},
-					}
-					unmarshalled["aliases"] = aliasPart
-					newConfig, err := json.Marshal(unmarshalled)
-					if err != nil {
-						log.Printf("[ERROR] Invalid JSON in OPENSEARCH_INDEX_CONFIG (3): %s", err)
-					} else {
-						indexConfig = newConfig
-						log.Printf("[INFO] Injected alias into OPENSEARCH_INDEX_CONFIG for index %s", index)
-					}
-				}
-			}
-
-		}
-
-		index = strings.ToLower(index)
-		initialIndexName := fmt.Sprintf("%s-000001", index)
-		indexConfig = ensureOpensearchIndexRolloverAlias(indexConfig, index)
-		// Directly try to force create it. Opensearch throws a 400 if it fails.
-
-		resp, err := project.Es.Indices.Create(ctx, opensearchapi.IndicesCreateReq{
-			Index: initialIndexName,
-			Body:  bytes.NewReader(indexConfig),
-		})
-
-		res := resp.Inspect().Response
-		defer res.Body.Close()
-		if err != nil {
-			if !strings.Contains(fmt.Sprintf("%s", err), "serverless mode") && !strings.Contains(fmt.Sprintf("%s", err), "resource_already_exists_exception") {
-				log.Printf("[WARNING] Error creating index %s: %s", index, err)
-			}
-
-			// Make sure if the resource exist it is part of correct alias
-			if strings.Contains(fmt.Sprintf("%s", err), "resource_already_exists_exception") {
-				body := fmt.Sprintf(`{
-				  "actions": [
-				    {
-				      "add": {
-				        "index": "%s",
-				        "alias": "%s",
-				        "is_write_index": true
-				      }
-				    }
-				  ]
-				}`, initialIndexName, index)
-
-				aliasResp, aerr := project.Es.Aliases(ctx, opensearchapi.AliasesReq{
-					Body: strings.NewReader(body),
-				})
-				if aerr != nil {
-					log.Printf("[WARNING] Failed to ensure alias %s for index %s: %s", index, initialIndexName, aerr)
-					return
-				}
-
-				res := aliasResp.Inspect().Response
-				defer res.Body.Close()
-
-				if res.StatusCode >= 300 {
-					log.Printf("[WARNING] Alias enforcement failed: %s", res.String())
-					return
-				}
-			}
-		} else {
-			if res.IsError() {
-				if !strings.Contains(res.String(), "resource_already_exists_exception") {
-					log.Printf("[DEBUG] Error creating index %s with custom config: %s", index, res.String())
-				}
-
-			} else {
-				log.Printf("[DEBUG] Successfully created index %s with custom config", index)
-			}
-		}
-
-		if ismReady {
-			if err := ensureOpensearchIndexRolloverAliasSetting(ctx, opensearchUrl, initialIndexName, index); err != nil {
-				log.Printf("[WARNING] Failed ensuring rollover_alias on index %s: %s", initialIndexName, err)
-			}
-
-			if err := ensureOpensearchIndexISMPolicy(ctx, opensearchUrl, initialIndexName, ismPolicyName); err != nil {
-				log.Printf("[WARNING] Failed attaching ISM policy '%s' to %s: %s", ismPolicyName, initialIndexName, err)
-			}
-
-			continue
-		}
-
-		rolloverResp, err := project.Es.Indices.Rollover(ctx, opensearchapi.IndicesRolloverReq{
-			Alias: index,
-			Body:  bytes.NewReader(rolloverConfig),
-		})
-
-		if err != nil {
-			if !strings.Contains(fmt.Sprintf("%s", err), "serverless mode") && !strings.Contains(fmt.Sprintf("%s", err), "status: 404") {
-				log.Printf("[WARNING] Problem during rollover config for %s: %s", index, err)
-			}
-
-			continue
-		}
-
-		rolloverRes := rolloverResp.Inspect().Response
-		defer rolloverRes.Body.Close()
-		if rolloverRes.IsError() {
-			log.Printf("[ERROR] Rollover config failed for %s: %s", index, rolloverRes.String())
-		} else {
-			log.Printf("[INFO] Rollover executed successfully for %s", index)
-		}
-
-	}
-
-	if fixResult, fixErr := FixOpensearchIndexPrefix(ctx); fixErr != nil {
-		log.Printf("[WARNING] Alias verification after init failed: %s", fixErr)
-	} else if !fixResult.Success {
-		log.Printf("[WARNING] Alias verification after init completed with warnings: %s", fixResult.Reason)
-	} else {
-		log.Printf("[INFO] Alias verification after init passed: expected aliases=%d found=%d", fixResult.ExpectedAliases, fixResult.FoundAliases)
-	}
-
-}
-
-func ensureOpensearchIndexRolloverAlias(indexConfig []byte, alias string) []byte {
-	unmarshalled := map[string]interface{}{}
-	if err := json.Unmarshal(indexConfig, &unmarshalled); err != nil {
-		return indexConfig
-	}
-
-	settings, ok := unmarshalled["settings"].(map[string]interface{})
-	if !ok || settings == nil {
-		settings = map[string]interface{}{}
-	}
-
-	settings["plugins.index_state_management.rollover_alias"] = alias
-	unmarshalled["settings"] = settings
-
-	updated, err := json.Marshal(unmarshalled)
-	if err != nil {
-		return indexConfig
-	}
-
-	return updated
-}
-
-func getOpensearchISMRolloverConditions(rolloverConfig []byte) map[string]interface{} {
-	defaultConditions := map[string]interface{}{
-		"min_index_age": "90d",
-		"min_size":      "40gb",
-		"min_doc_count": 1000000,
-	}
-
-	parsed := struct {
-		Conditions map[string]interface{} `json:"conditions"`
-	}{}
-
-	if err := json.Unmarshal(rolloverConfig, &parsed); err != nil {
-		return defaultConditions
-	}
-
-	if len(parsed.Conditions) == 0 {
-		return defaultConditions
-	}
-
-	conditions := map[string]interface{}{}
-	if value, ok := parsed.Conditions["min_index_age"]; ok {
-		conditions["min_index_age"] = value
-	} else if value, ok := parsed.Conditions["max_age"]; ok {
-		conditions["min_index_age"] = value
-	}
-
-	if value, ok := parsed.Conditions["min_size"]; ok {
-		conditions["min_size"] = value
-	} else if value, ok := parsed.Conditions["max_size"]; ok {
-		conditions["min_size"] = value
-	}
-
-	if value, ok := parsed.Conditions["min_doc_count"]; ok {
-		conditions["min_doc_count"] = value
-	} else if value, ok := parsed.Conditions["max_docs"]; ok {
-		conditions["min_doc_count"] = value
-	}
-
-	if len(conditions) == 0 {
-		return defaultConditions
-	}
-
-	return conditions
-}
-
-func ensureOpensearchISMRolloverPolicy(ctx context.Context, opensearchUrl string, aliases []string, rolloverConfig []byte, policyName string) (bool, error) {
-	conditions := getOpensearchISMRolloverConditions(rolloverConfig)
-
-	patterns := []string{}
-	for _, alias := range aliases {
-		patterns = append(patterns, fmt.Sprintf("%s-*", alias))
-	}
-
-	policyBody := map[string]interface{}{
-		"policy": map[string]interface{}{
-			"description":   "Shuffle rollover policy",
-			"default_state": "hot",
-			"states": []map[string]interface{}{
-				{
-					"name": "hot",
-					"actions": []map[string]interface{}{
-						{
-							"rollover": conditions,
-						},
-					},
-					"transitions": []interface{}{},
-				},
-			},
-			"ism_template": []map[string]interface{}{
-				{
-					"index_patterns": patterns,
-					"priority":       100,
-				},
-			},
-		},
-	}
-
-	policyData, err := json.Marshal(policyBody)
-	if err != nil {
-		return false, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "PUT", fmt.Sprintf("%s/_plugins/_ism/policies/%s", opensearchUrl, policyName), bytes.NewReader(policyData))
-	if err != nil {
-		return false, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := project.Es.Client.Transport.Perform(req)
-	if err != nil {
-		return false, err
-	}
-	defer resp.Body.Close()
-
-	body, _ := ioutil.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		if resp.StatusCode == 404 || resp.StatusCode == 400 {
-			if strings.Contains(strings.ToLower(string(body)), "_plugins/_ism") || strings.Contains(strings.ToLower(string(body)), "no handler found") {
-				log.Printf("[INFO] ISM plugin not available. Falling back to direct rollover")
-				return false, nil
-			}
-		}
-
-		return false, fmt.Errorf("status: %d, body: %s", resp.StatusCode, string(body))
-	}
-
-	log.Printf("[INFO] Ensured ISM rollover policy '%s' for %d index patterns", policyName, len(patterns))
-	return true, nil
-}
-
-func ensureOpensearchIndexRolloverAliasSetting(ctx context.Context, opensearchUrl, indexName, alias string) error {
-	settingsBody := map[string]interface{}{
-		"index": map[string]interface{}{
-			"plugins.index_state_management.rollover_alias": alias,
-		},
-	}
-
-	body, err := json.Marshal(settingsBody)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "PUT", fmt.Sprintf("%s/%s/_settings", opensearchUrl, indexName), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := project.Es.Client.Transport.Perform(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := ioutil.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		if resp.StatusCode == 404 && strings.Contains(strings.ToLower(string(respBody)), "index_not_found_exception") {
-			return nil
-		}
-
-		return fmt.Errorf("status: %d, body: %s", resp.StatusCode, string(respBody))
-	}
-
-	return nil
-}
-
-func ensureOpensearchIndexISMPolicy(ctx context.Context, opensearchUrl, indexName, policyName string) error {
-	policyBody := map[string]interface{}{
-		"policy_id": policyName,
-	}
-
-	body, err := json.Marshal(policyBody)
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", fmt.Sprintf("%s/_plugins/_ism/add/%s", opensearchUrl, indexName), bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := project.Es.Client.Transport.Perform(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := ioutil.ReadAll(resp.Body)
-	if resp.StatusCode >= 300 {
-		lowerResp := strings.ToLower(string(respBody))
-		if strings.Contains(lowerResp, "already has a policy") {
-			return nil
-		}
-
-		if resp.StatusCode == 404 && strings.Contains(lowerResp, "index_not_found_exception") {
-			return nil
-		}
-
-		return fmt.Errorf("status: %d, body: %s", resp.StatusCode, string(respBody))
-	}
-
-	return nil
+	go StartNotificationRetentionSweeper(context.Background())
 }
 
 func ListVulnerabilities(ctx context.Context, ecosystem string, inputcursor string) ([]OSVVulnerability, string, error) {
