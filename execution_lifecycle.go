@@ -111,12 +111,12 @@ func init() {
 // signaled so the caller moves the doc back to live instead of leaving two
 // diverging copies or writing into the (supposed to be append-only) archive.
 func resolveExecutionWriteTarget(incomingStatus string, archiveStatusLookup func() (status string, found bool)) (targetIndex string, unarchive bool, err error) {
-	_, found := archiveStatusLookup()
+	archiveStatus, found := archiveStatusLookup()
 	if !found {
 		return liveExecutionBaseIndex(), false, nil
 	}
 
-	if isTerminalExecutionStatus(incomingStatus) {
+	if isTerminalExecutionStatus(archiveStatus) && isTerminalExecutionStatus(incomingStatus) {
 		return "", false, ErrExecutionArchived
 	}
 
@@ -433,7 +433,18 @@ func sweepArchivableExecutions(ctx context.Context) error {
 		log.Printf("[DEBUG] Execution archival sweep already in progress elsewhere, skipping this pass")
 		return nil
 	}
-	_ = SetCache(ctx, lockKey, []byte("1"), 300)
+	// 5 minutes: SetCache's non-millisecond unit is minutes, not seconds -
+	// pass a plain minute value here (not a millisecond conversion), since
+	// the gomemcache backend (external/shared memcached) ignores the
+	// useMilliseconds flag entirely and multiplies by 60 unconditionally;
+	// passing milliseconds there would overflow into memcached's
+	// absolute-Unix-timestamp range and expire the lock instantly.
+	_ = SetCache(ctx, lockKey, []byte("1"), 5)
+	defer func() {
+		if err := DeleteCache(ctx, lockKey); err != nil {
+			log.Printf("[WARNING] Failed releasing execution sweep lock %s: %s", lockKey, err)
+		}
+	}()
 
 	query := buildArchivalSweepQuery(time.Now(), getExecutionGracePeriod())
 
@@ -548,7 +559,15 @@ func migrateInFlightExecutionsToLive(ctx context.Context) error {
 		log.Printf("[DEBUG] In-flight execution migration already in progress elsewhere, skipping")
 		return nil
 	}
-	_ = SetCache(ctx, lockKey, []byte("1"), 600)
+	// 10 minutes, plain minute value - see the lock in sweepArchivableExecutions
+	// above for why milliseconds must not be used here (gomemcache backend
+	// ignores useMilliseconds and would overflow into an absolute timestamp).
+	_ = SetCache(ctx, lockKey, []byte("1"), 10)
+	defer func() {
+		if err := DeleteCache(ctx, lockKey); err != nil {
+			log.Printf("[WARNING] Failed releasing execution migration lock %s: %s", lockKey, err)
+		}
+	}()
 
 	query := buildInFlightExecutionsQuery()
 

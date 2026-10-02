@@ -14182,6 +14182,29 @@ func SetDatastoreKeyBulk(ctx context.Context, allKeys []CacheKeyData) ([]Datasto
 			sameValue := false
 			config, getCacheError := GetDatastoreKey(ctx, datastoreId, cacheData.Category)
 
+			// GetDatastoreKey returns the same "Key doesn't exist" sentinel
+			// error for a genuinely-new key everywhere it's returned. Any
+			// other error means the fetch itself failed (network/mapping/
+			// etc.) and we CANNOT tell whether the key already exists - in
+			// that case config is unreliable and must not be trusted for
+			// merging or for the existing-key metadata (Authorization,
+			// SuborgDistribution, PublicAuthorization) below.
+			//
+			// Simply gating the merge on getCacheError==nil isn't enough:
+			// an enrichment-only update would still write cacheData.Value
+			// as empty (blanking a real value), and cacheData.PublicAuthorization
+			// would still get a freshly minted UUID further down since it
+			// wasn't copied from config - silently rotating/breaking any
+			// existing public link for this key. So on an uncertain fetch
+			// failure we skip this key's write entirely for this pass
+			// rather than risk corrupting it; the channels are drained via
+			// range after close(), so simply not sending here is safe and
+			// leaves the existing data untouched for a future retry.
+			if getCacheError != nil && getCacheError.Error() != "Key doesn't exist" {
+				log.Printf("[WARNING] Failed looking up existing datastore key '%s' (category '%s', org '%s') before bulk update - skipping this key's write to avoid corrupting existing data: %s", cacheData.Key, cacheData.Category, cacheData.OrgId, getCacheError)
+				return
+			}
+
 			if getCacheError == nil && config.Value == cacheData.Value {
 				sameValue = true
 			}

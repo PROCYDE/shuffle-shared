@@ -15602,7 +15602,17 @@ func AbortExecution(resp http.ResponseWriter, request *http.Request) {
 	// This is the same as aborted
 	IncrementCache(ctx, workflowExecution.ExecutionOrg, "workflow_executions_failed")
 	err = SetWorkflowExecution(ctx, *workflowExecution, true)
-	if err != nil {
+	if err == ErrExecutionArchived {
+		// Execution is already archived and terminal on both sides - the
+		// abort is a no-op re-affirmation of an already-finished execution,
+		// not a real failure. Treat it as an idempotent success instead of
+		// erroring, so retries/duplicate abort calls don't surface a
+		// misleading failure for something that already happened.
+		log.Printf("[INFO][%s] Execution already archived and terminal - treating abort as idempotent success", workflowExecution.ExecutionId)
+		resp.WriteHeader(200)
+		resp.Write([]byte(fmt.Sprintf(`{"success": true}`)))
+		return
+	} else if err != nil {
 		log.Printf("[WARNING] Error saving workflow execution for updates when aborting (2) %s: %s", topic, err)
 		resp.WriteHeader(401)
 		resp.Write([]byte(fmt.Sprintf(`{"success": false, "reason": "Failed setting workflowexecution status to abort"}`)))
