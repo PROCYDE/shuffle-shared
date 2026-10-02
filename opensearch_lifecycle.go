@@ -621,11 +621,51 @@ func collapseSingleIndexAliases(ctx context.Context, opensearchUrl, fullIndex st
 		return err
 	}
 
-	generations := []string{}
+	// Generation discovery is a UNION of two signals, not name-matching
+	// alone:
+	//
+	//  1. Name-prefix matching (idx == fullIndex or idx starting with
+	//     fullIndex+"-"), including the double-prefixed variant
+	//     ("<prefix>_"+fullIndex+"-*") that a historical bug could produce
+	//     when SHUFFLE_OPENSEARCH_INDEX_PREFIX is set. This catches
+	//     generations even if their alias was already detached (e.g. an
+	//     older generation orphaned by a previous run of this function that
+	//     removed the alias but crashed/failed before deleting the index).
+	//  2. Alias-membership (does the index currently have fullIndex
+	//     attached as an alias), via getOpensearchAliases - the source of
+	//     truth used everywhere else in the lifecycle code, robust to any
+	//     naming quirk.
+	//
+	// Using either signal alone has a real gap: name-matching alone missed
+	// double-prefixed generations entirely (silently no-opping instead of
+	// collapsing them); alias-membership alone would miss an orphaned
+	// index that already lost its alias in a prior partial failure,
+	// leaking it forever. The union catches both.
+	prefix := strings.ToLower(strings.TrimSpace(os.Getenv("SHUFFLE_OPENSEARCH_INDEX_PREFIX")))
+	generationSet := map[string]bool{}
 	for _, idx := range allIndices {
 		if idx == fullIndex || strings.HasPrefix(idx, fullIndex+"-") {
-			generations = append(generations, idx)
+			generationSet[idx] = true
+			continue
 		}
+		if prefix != "" && strings.HasPrefix(idx, prefix+"_"+fullIndex+"-") {
+			generationSet[idx] = true
+		}
+	}
+
+	aliasInfo, err := getOpensearchAliases(foundClient, opensearchUrl)
+	if err != nil {
+		return err
+	}
+	for idx, aliases := range aliasInfo {
+		if _, ok := aliases[fullIndex]; ok {
+			generationSet[idx] = true
+		}
+	}
+
+	generations := make([]string, 0, len(generationSet))
+	for idx := range generationSet {
+		generations = append(generations, idx)
 	}
 
 	if len(generations) == 1 {
@@ -1821,6 +1861,19 @@ func startOpensearchReindexTask(foundClient opensearchapi.Client, opensearchUrl,
 		},
 		"dest": map[string]interface{}{
 			"index": targetIndex,
+			// op_type:create makes each write a create-only op, which
+			// OpenSearch rejects as a version conflict if the _id already
+			// exists in the target. Combined with conflicts:proceed below,
+			// that conflict is skipped rather than aborting the reindex -
+			// so an existing target document always wins over the source
+			// being reindexed. This is required for "newest generation
+			// wins" semantics wherever this is used to merge an older
+			// generation into the current write generation (e.g.
+			// collapseSingleIndexAliases, collision migration) - without
+			// it, the default index op_type overwrites the (newer) target
+			// document with the (older) source document on any _id
+			// collision, silently reverting data.
+			"op_type": "create",
 		},
 		"conflicts": "proceed",
 	}

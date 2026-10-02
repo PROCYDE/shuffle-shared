@@ -98,6 +98,14 @@ func TestResolveExecutionWriteTarget(t *testing.T) {
 			wantUnarchive:    true,
 			wantErr:          nil,
 		},
+		{
+			name:             "terminal write against a non-terminal archived execution triggers unarchive rather than rejection",
+			incomingStatus:   "FINISHED",
+			archiveHasStatus: "EXECUTING",
+			wantIndex:        "workflowexecution_live",
+			wantUnarchive:    true,
+			wantErr:          nil,
+		},
 	}
 
 	for _, tt := range tests {
