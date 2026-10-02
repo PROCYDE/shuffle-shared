@@ -6054,6 +6054,14 @@ type AppActionResponse struct {
 	Actions        []ActionSummary `json:"actions"`
 }
 
+type AuditLogCollector struct {
+	Config     TelemetryConfig
+	Platform   string
+	LogChannel chan AuditLogEntry
+	StopChan   chan bool
+	mu         sync.Mutex
+}
+
 // WorkflowOperation represents a single modification operation
 type WorkflowOperation struct {
 	Op             string          `json:"op"`                        // "add_node", "edit_node", "move_node", "delete_node", "add_branch", "edit_branch", "delete_branch", "add_condition", "edit_condition", "delete_condition"
