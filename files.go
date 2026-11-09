@@ -796,7 +796,7 @@ func HandleGetFileNamespace(resp http.ResponseWriter, request *http.Request) {
 						WorkflowId:   "global",
 						DownloadPath: downloadPath,
 						Subflows:     []string{},
-						StorageArea:  "local",
+						StorageArea:  StorageAreaName(),
 						Namespace:    namespace,
 						Tags: []string{
 							"standard",
@@ -1130,7 +1130,64 @@ func GetFileContent(ctx context.Context, file *File, resp http.ResponseWriter) (
 		}
 
 	} else if file.StorageArea == "s3" {
-		log.Printf("[INFO] Trying to download file %s from s3", file.Id)
+		log.Printf("[INFO] Downloading file %s from object storage", file.Id)
+		allText, err := ReadStorageData(downloadPath)
+		if err != nil {
+			file.Status = "deleted"
+			err = SetFile(ctx, *file)
+			if err != nil {
+				log.Printf("Failed setting file to uploading")
+				if resp != nil {
+					resp.WriteHeader(500)
+					resp.Write([]byte(`{"success": false, "reason": "Failed setting file to deleted"}`))
+				}
+
+				return []byte{}, err
+			}
+
+			//File not found, send 404
+			if resp != nil {
+				resp.WriteHeader(400)
+				resp.Write([]byte(`{"success": false, "reason": "File doesn't exist in object storage"}`))
+			}
+
+			return []byte{}, err
+		}
+
+		if file.Encrypted {
+			passphrase := fmt.Sprintf("%s_%s", file.OrgId, file.Id)
+			data, err := HandleKeyDecryption(allText, passphrase)
+			if err != nil {
+				if len(file.ReferenceFileId) > 0 {
+					passphrase = fmt.Sprintf("%s_%s", file.OrgId, file.ReferenceFileId)
+					data, err = HandleKeyDecryption(allText, passphrase)
+					if err != nil {
+						log.Printf("[ERROR] Failed decrypting file (5): %s", err)
+					}
+
+					allText = []byte(data)
+				} else {
+					log.Printf("[ERROR] Failed decrypting file (2): %s", err)
+				}
+
+			} else {
+				//log.Printf("[DEBUG] File size reduced from %d to %d after decryption (s3)", len(allText), len(data))
+				allText = []byte(data)
+			}
+		}
+
+		FileContentType := http.DetectContentType(allText)
+		FileSize := strconv.FormatInt(int64(len(allText)), 10)
+
+		if resp != nil {
+			resp.Header().Set("Content-Disposition", "attachment; filename="+file.Filename)
+			resp.Header().Set("Content-Type", FileContentType)
+			resp.Header().Set("Content-Length", FileSize)
+			reader := bytes.NewReader(allText)
+			io.Copy(resp, reader)
+		}
+
+		return allText, nil
 	} else {
 		log.Printf("[INFO] Downloadpath: %s", downloadPath)
 		Openfile, err := os.Open(downloadPath)
@@ -1625,7 +1682,29 @@ func UploadFile(ctx context.Context, file *File, encryptionKey string, contents 
 			// Close, just like writing a file.
 			defer w.Close()
 		} else if file.StorageArea == "s3" {
-			log.Printf("SHOULD UPLOAD TO S3!")
+			backend, backendErr := GetFileStorage()
+			if backendErr != nil {
+				file.Status = "created"
+				SetFile(ctx, *file)
+				log.Printf("[ERROR] Object storage backend unavailable for file %s: %s", file.Id, backendErr)
+				return file.Id, backendErr
+			}
+			if _, isLocal := backend.(*localStorage); isLocal {
+				file.Status = "created"
+				SetFile(ctx, *file)
+				backendErr = errors.New("file has StorageArea=s3 but SHUFFLE_STORAGE_BACKEND is local")
+				log.Printf("[ERROR] Object storage backend unavailable for file %s: %s", file.Id, backendErr)
+				return file.Id, backendErr
+			}
+
+			if appendErr := backend.Append(ctx, storageKey(file.DownloadPath), bytes.NewReader(contents)); appendErr != nil {
+				file.Status = "created"
+				SetFile(ctx, *file)
+				log.Printf("[ERROR] Failed uploading file to object storage %s: %s", file.DownloadPath, appendErr)
+				return file.Id, appendErr
+			}
+
+			log.Printf("[INFO] Added %d bytes to object storage file %s", len(contents), file.DownloadPath)
 		} else {
 			f, err := os.OpenFile(file.DownloadPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, os.ModePerm)
 
@@ -1903,7 +1982,7 @@ func HandleCreateFile(resp http.ResponseWriter, request *http.Request) {
 		WorkflowId:   curfile.WorkflowId,
 		DownloadPath: downloadPath,
 		Subflows:     duplicateWorkflows,
-		StorageArea:  "local",
+		StorageArea:  StorageAreaName(),
 		Namespace:    curfile.Namespace,
 		Tags:         curfile.Tags,
 	}
@@ -2073,7 +2152,7 @@ func HandleDownloadRemoteFiles(resp http.ResponseWriter, request *http.Request) 
 			WorkflowId:   "global",
 			DownloadPath: downloadPath,
 			Subflows:     []string{},
-			StorageArea:  "local",
+			StorageArea:  StorageAreaName(),
 			Namespace:    strings.ReplaceAll(strings.ReplaceAll(path, "/", "_"), "..", "_"),
 			Tags: []string{
 				input.URL,
