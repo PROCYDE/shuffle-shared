@@ -14829,14 +14829,6 @@ func SetDatastoreKeyBulk(ctx context.Context, allKeys []CacheKeyData) ([]Datasto
 								}
 							}
 
-<<<<<<< HEAD
-=======
-							if debug {
-								log.Printf("\n\nOLD: %s\n\nNEW: %s\n\n", oldDoc, newDoc)
-							}
-
-							mergedJSON, allowed, errString := EvalPolicyJSON(foundRule, oldDoc, newDoc)
->>>>>>> 3cfcef2 (Harden OpenSearch index lifecycle management (index hygiene))
 							if debug {
 								log.Printf("[DEBUG] FOUND SECURITY RULES AUTOMATION FOR ORG %s AND CATEGORY %s: %#v", cacheData.OrgId, mainCategory, foundRule)
 							}
